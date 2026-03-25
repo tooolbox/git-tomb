@@ -15,6 +15,9 @@ import (
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/term"
+
 	"github.com/tooolbox/git-tomb/crypt"
 	"github.com/tooolbox/git-tomb/tomb"
 )
@@ -413,6 +416,7 @@ func sshDir() (string, error) {
 }
 
 // loadIdentities loads the user's SSH private keys for decryption.
+// Supports passphrase-protected keys by prompting on stderr/stdin.
 func loadIdentities() ([]age.Identity, error) {
 	dir, err := sshDir()
 	if err != nil {
@@ -426,17 +430,48 @@ func loadIdentities() ([]age.Identity, error) {
 
 	for _, name := range keyFiles {
 		path := filepath.Join(dir, name)
-		data, err := os.ReadFile(path)
+		pemData, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		id, err := agessh.ParseIdentity(data)
+
+		// Try parsing without passphrase first.
+		id, err := agessh.ParseIdentity(pemData)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "tomb: loaded key %s\n", name)
+			identities = append(identities, id)
+			continue
+		}
+
+		// Check if it's passphrase-protected.
+		if !strings.Contains(err.Error(), "passphrase") {
+			fmt.Fprintf(os.Stderr, "tomb: skipping %s: %v\n", name, err)
+			continue
+		}
+
+		// Parse the public key from the .pub file to get the key type.
+		pubPath := path + ".pub"
+		pubData, err := os.ReadFile(pubPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tomb: skipping %s: passphrase-protected but no .pub file found\n", name)
+			continue
+		}
+		pubKey, _, _, _, err := ssh.ParseAuthorizedKey(pubData)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tomb: skipping %s: could not parse public key: %v\n", name, err)
+			continue
+		}
+
+		// Use NewEncryptedSSHIdentity with a passphrase prompt.
+		encID, err := agessh.NewEncryptedSSHIdentity(pubKey, pemData, func() ([]byte, error) {
+			return readPassphrase(fmt.Sprintf("Enter passphrase for %s: ", path))
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tomb: skipping %s: %v\n", name, err)
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "tomb: loaded key %s\n", name)
-		identities = append(identities, id)
+		fmt.Fprintf(os.Stderr, "tomb: loaded key %s (passphrase-protected)\n", name)
+		identities = append(identities, encID)
 	}
 
 	if len(identities) == 0 {
@@ -444,6 +479,28 @@ func loadIdentities() ([]age.Identity, error) {
 	}
 
 	return identities, nil
+}
+
+// readPassphrase prompts for a passphrase on stderr and reads from the terminal.
+// stdin is used by the git remote helper protocol, so we open the terminal directly.
+func readPassphrase(prompt string) ([]byte, error) {
+	fmt.Fprint(os.Stderr, prompt)
+
+	// Open the terminal directly — stdin is taken by the git protocol.
+	tty, err := os.Open("CONIN$") // Windows console input.
+	if err != nil {
+		// Try /dev/tty for Unix.
+		tty, err = os.Open("/dev/tty")
+		if err != nil {
+			return nil, fmt.Errorf("cannot open terminal for passphrase input: %w", err)
+		}
+	}
+	defer tty.Close()
+
+	fd := int(tty.Fd())
+	pass, err := term.ReadPassword(fd)
+	fmt.Fprintln(os.Stderr) // newline after passphrase
+	return pass, err
 }
 
 // run executes a command in the given directory, inheriting stderr.
