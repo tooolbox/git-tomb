@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 
 	"github.com/tooolbox/git-tomb/keys"
@@ -36,6 +37,8 @@ func main() {
 		cmdList()
 	case "refresh":
 		cmdRefresh()
+	case "version", "--version", "-v":
+		cmdVersion()
 	case "help", "--help", "-h":
 		usage()
 	default:
@@ -350,6 +353,50 @@ func cmdRefresh() {
 	}
 
 	fmt.Println("Done.")
+}
+
+func cmdVersion() {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		fmt.Println("git-tomb (unknown version)")
+		return
+	}
+
+	version := info.Main.Version
+	if version == "" || version == "(devel)" {
+		version = "dev"
+	}
+
+	fmt.Printf("git-tomb %s\n", version)
+
+	// Print VCS info if available (commit, dirty, time).
+	var commit, time string
+	var dirty bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			commit = s.Value
+		case "vcs.time":
+			time = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if commit != "" {
+		short := commit
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		suffix := ""
+		if dirty {
+			suffix = " (dirty)"
+		}
+		fmt.Printf("  commit: %s%s\n", short, suffix)
+	}
+	if time != "" {
+		fmt.Printf("  built:  %s\n", time)
+	}
+	fmt.Printf("  go:     %s\n", info.GoVersion)
 }
 
 func gitRepoRoot() (string, error) {
