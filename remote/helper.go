@@ -487,10 +487,11 @@ func readPassphrase(prompt string) ([]byte, error) {
 	fmt.Fprint(os.Stderr, prompt)
 
 	// Open the terminal directly — stdin is taken by the git protocol.
-	tty, err := os.Open("CONIN$") // Windows console input.
+	// Try /dev/tty first (works on Unix and Git Bash/MSYS2 on Windows).
+	tty, err := os.Open("/dev/tty")
 	if err != nil {
-		// Try /dev/tty for Unix.
-		tty, err = os.Open("/dev/tty")
+		// Fall back to Windows console input.
+		tty, err = os.Open("CONIN$")
 		if err != nil {
 			return nil, fmt.Errorf("cannot open terminal for passphrase input: %w", err)
 		}
