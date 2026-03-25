@@ -26,6 +26,8 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "init":
+		cmdInit(os.Args[2:])
 	case "add":
 		cmdAdd(os.Args[2:])
 	case "remove", "rm":
@@ -47,21 +49,116 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: git tomb <command> [args]
 
 Commands:
+  init [provider] [username]  Initialize a tomb (adds your keys)
   add <provider> <username>   Add a recipient (fetches their SSH keys)
   remove <username>           Remove a recipient
   list                        List all recipients
   refresh                     Re-fetch keys for all recipients
 
-Providers: github, gitlab
+Providers: github, gitlab, file
+
+Init examples:
+  git tomb init                             # auto-discover local ~/.ssh/ keys
+  git tomb init github mmccullough          # use GitHub SSH keys
+  git tomb init file ~/.ssh/id_ed25519.pub  # use a specific key file
+
+Workflow:
+  git tomb init github mmccullough
+  git tomb add github joeblow
+  git remote add origin tomb::https://github.com/user/repo.git
+  git push origin main
 
 Install:
   go install github.com/tooolbox/git-tomb/cmd/...@latest
-
-Example:
-  git tomb add github mmccullough
-  git remote add origin tomb::https://github.com/user/repo.git
-  git push origin main
 `)
+}
+
+func cmdInit(args []string) {
+	// Check we're in a git repo.
+	gitRoot, err := gitRepoRoot()
+	if err != nil {
+		fatal("not in a git repository — run 'git init' first")
+	}
+
+	// Check we're not already initialized.
+	if _, err := tomb.FindRoot(gitRoot); err == nil {
+		fatal("tomb is already initialized in this repository")
+	}
+
+	// Determine how to get keys.
+	var provider string
+	var username string
+	var fetchedKeys []keys.Key
+
+	switch len(args) {
+	case 0:
+		// Auto-discover local SSH keys.
+		provider = "file"
+		fmt.Println("Discovering local SSH keys...")
+		p, pErr := keys.Get("file")
+		if pErr != nil {
+			fatal("file provider not registered: %v", pErr)
+		}
+		fetchedKeys, err = p.FetchKeys("")
+		if err != nil {
+			fatal("no SSH keys found: %v\nTry: git tomb init github <username>", err)
+		}
+	case 2:
+		provider = args[0]
+		username = args[1]
+		p, err := keys.Get(provider)
+		if err != nil {
+			fatal("%v\nAvailable providers: %s", err, strings.Join(keys.Providers(), ", "))
+		}
+		if provider == "file" {
+			fmt.Printf("Reading SSH key from %s...\n", username)
+		} else {
+			fmt.Printf("Fetching SSH keys for %s from %s...\n", username, provider)
+		}
+		fetchedKeys, err = p.FetchKeys(username)
+		if err != nil {
+			fatal("failed to fetch keys: %v", err)
+		}
+	default:
+		fatal("usage: git tomb init [provider username]")
+	}
+
+	if len(fetchedKeys) == 0 {
+		fatal("no SSH keys found — cannot initialize tomb without your keys")
+	}
+
+	// Build recipient.
+	var pinned []tomb.PinnedKey
+	for _, k := range fetchedKeys {
+		pinned = append(pinned, tomb.PinnedKey{
+			Raw:         k.Raw,
+			Fingerprint: k.Fingerprint,
+		})
+	}
+
+	displayName := username
+	if displayName == "" {
+		displayName = "local"
+	}
+
+	cfg := &tomb.Config{
+		Recipients: []tomb.Recipient{
+			{
+				Provider: provider,
+				Username: displayName,
+				Keys:     pinned,
+			},
+		},
+	}
+
+	if err := tomb.SaveConfig(gitRoot, cfg); err != nil {
+		fatal("saving config: %v", err)
+	}
+
+	fmt.Printf("Tomb initialized with %d key(s) for %s:\n", len(fetchedKeys), displayName)
+	for _, k := range fetchedKeys {
+		fmt.Printf("  %s %s\n", k.Fingerprint, strings.Fields(k.Raw)[0])
+	}
 }
 
 func cmdAdd(args []string) {
@@ -70,12 +167,21 @@ func cmdAdd(args []string) {
 	}
 	provider, username := args[0], args[1]
 
+	root, err := tomb.FindRoot(".")
+	if err != nil {
+		fatal("not a tomb repository — run 'git tomb init' first")
+	}
+
 	p, err := keys.Get(provider)
 	if err != nil {
 		fatal("%v\nAvailable providers: %s", err, strings.Join(keys.Providers(), ", "))
 	}
 
-	fmt.Printf("Fetching SSH keys for %s from %s...\n", username, provider)
+	if provider == "file" {
+		fmt.Printf("Reading SSH key from %s...\n", username)
+	} else {
+		fmt.Printf("Fetching SSH keys for %s from %s...\n", username, provider)
+	}
 	fetchedKeys, err := p.FetchKeys(username)
 	if err != nil {
 		fatal("failed to fetch keys: %v", err)
@@ -83,11 +189,6 @@ func cmdAdd(args []string) {
 
 	if len(fetchedKeys) == 0 {
 		fatal("no SSH keys found for %s on %s", username, provider)
-	}
-
-	root, err := findOrInitRoot()
-	if err != nil {
-		fatal("%v", err)
 	}
 
 	cfg, err := tomb.LoadConfig(root)
@@ -127,7 +228,7 @@ func cmdRemove(args []string) {
 
 	root, err := tomb.FindRoot(".")
 	if err != nil {
-		fatal("%v", err)
+		fatal("not a tomb repository — run 'git tomb init' first")
 	}
 
 	cfg, err := tomb.LoadConfig(root)
@@ -149,7 +250,7 @@ func cmdRemove(args []string) {
 func cmdList() {
 	root, err := tomb.FindRoot(".")
 	if err != nil {
-		fatal("%v", err)
+		fatal("not a tomb repository — run 'git tomb init' first")
 	}
 
 	cfg, err := tomb.LoadConfig(root)
@@ -173,7 +274,7 @@ func cmdList() {
 func cmdRefresh() {
 	root, err := tomb.FindRoot(".")
 	if err != nil {
-		fatal("%v", err)
+		fatal("not a tomb repository — run 'git tomb init' first")
 	}
 
 	cfg, err := tomb.LoadConfig(root)
@@ -187,6 +288,11 @@ func cmdRefresh() {
 	}
 
 	for i, r := range cfg.Recipients {
+		if r.Provider == "file" {
+			fmt.Printf("Skipping %s (local key, use 'git tomb add file <path>' to update)\n", r.Username)
+			continue
+		}
+
 		p, err := keys.Get(r.Provider)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: unknown provider %q for %s, skipping\n", r.Provider, r.Username)
@@ -246,23 +352,13 @@ func cmdRefresh() {
 	fmt.Println("Done.")
 }
 
-// findOrInitRoot finds an existing .tomb dir or creates one in the current git repo root.
-func findOrInitRoot() (string, error) {
-	root, err := tomb.FindRoot(".")
-	if err == nil {
-		return root, nil
-	}
-
-	// No .tomb found — check if we're in a git repo and init there.
+func gitRepoRoot() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("not in a git repository — run 'git init' first")
+		return "", err
 	}
-
-	gitRoot := strings.TrimSpace(string(out))
-	fmt.Println("Initializing tomb in this repository...")
-	return gitRoot, nil
+	return strings.TrimSpace(string(out)), nil
 }
 
 func fatal(format string, args ...interface{}) {
