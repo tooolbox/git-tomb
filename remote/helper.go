@@ -384,6 +384,23 @@ func (h *helper) fetchRemoteRefs() ([]string, error) {
 	return refs, nil
 }
 
+// forgivingIdentity wraps an age.Identity and converts any error during
+// Unwrap into age.ErrIncorrectIdentity, so that age continues trying
+// other identities instead of aborting.
+type forgivingIdentity struct {
+	inner age.Identity
+	name  string
+}
+
+func (f *forgivingIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	fileKey, err := f.inner.Unwrap(stanzas)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tomb: key %s failed: %v, trying next key...\n", f.name, err)
+		return nil, age.ErrIncorrectIdentity
+	}
+	return fileKey, nil
+}
+
 // recipientsFromConfig converts pinned SSH keys in the config to age recipients.
 func recipientsFromConfig(cfg *tomb.Config) ([]age.Recipient, error) {
 	var recipients []age.Recipient
@@ -464,15 +481,18 @@ func loadIdentities() ([]age.Identity, error) {
 		}
 
 		// Use NewEncryptedSSHIdentity with a passphrase prompt.
+		keyPath := path // capture for closure
 		encID, err := agessh.NewEncryptedSSHIdentity(pubKey, pemData, func() ([]byte, error) {
-			return readPassphrase(fmt.Sprintf("Enter passphrase for %s: ", path))
+			return readPassphrase(fmt.Sprintf("Enter passphrase for %s: ", keyPath))
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tomb: skipping %s: %v\n", name, err)
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "tomb: loaded key %s (passphrase-protected)\n", name)
-		identities = append(identities, encID)
+		// Wrap in a forgiving identity that returns ErrIncorrectIdentity
+		// on passphrase failures, so age continues to the next identity.
+		identities = append(identities, &forgivingIdentity{inner: encID, name: name})
 	}
 
 	if len(identities) == 0 {
