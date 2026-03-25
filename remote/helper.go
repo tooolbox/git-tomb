@@ -482,49 +482,42 @@ func loadIdentities() ([]age.Identity, error) {
 	return identities, nil
 }
 
-// readPassphrase prompts for a passphrase and reads from the terminal.
-// stdin is used by the git remote helper protocol, so we open the terminal directly.
-// Matches the approach used by age itself (filippo.io/age/internal/term).
+// readPassphrase prompts for a passphrase.
+// Since stdin is used by the git remote helper protocol, we can't read from it.
+// Strategy:
+//  1. SSH_ASKPASS / GIT_ASKPASS — external program (works everywhere, including mintty)
+//  2. /dev/tty — Unix terminals
+//  3. Error with guidance
 func readPassphrase(prompt string) ([]byte, error) {
-	if runtime.GOOS == "windows" {
-		return readPassphraseWindows(prompt)
-	}
-	return readPassphraseUnix(prompt)
-}
-
-func readPassphraseWindows(prompt string) ([]byte, error) {
-	// Open Windows console directly (bypasses mintty pipe layer).
-	in, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open console input: %w", err)
-	}
-	defer in.Close()
-
-	// Write prompt to console output so it appears where the user types.
-	out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
-	if err != nil {
-		fmt.Fprint(os.Stderr, prompt)
-	} else {
-		fmt.Fprint(out, prompt)
-		defer out.Close()
+	// Try SSH_ASKPASS or GIT_ASKPASS (works in mintty, GUI environments, CI, etc.)
+	for _, env := range []string{"GIT_ASKPASS", "SSH_ASKPASS"} {
+		askpass := os.Getenv(env)
+		if askpass == "" {
+			continue
+		}
+		cmd := exec.Command(askpass, prompt)
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tomb: %s (%s) failed: %v\n", env, askpass, err)
+			continue
+		}
+		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
-	pass, err := term.ReadPassword(int(in.Fd()))
-	fmt.Fprintln(os.Stderr)
-	return pass, err
-}
-
-func readPassphraseUnix(prompt string) ([]byte, error) {
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open terminal: %w", err)
+	// Try /dev/tty (Unix terminals).
+	if runtime.GOOS != "windows" {
+		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err == nil {
+			defer tty.Close()
+			fmt.Fprint(tty, prompt)
+			pass, err := term.ReadPassword(int(tty.Fd()))
+			fmt.Fprintln(tty)
+			return pass, err
+		}
 	}
-	defer tty.Close()
 
-	fmt.Fprint(tty, prompt)
-	pass, err := term.ReadPassword(int(tty.Fd()))
-	fmt.Fprintln(tty)
-	return pass, err
+	return nil, fmt.Errorf("cannot prompt for passphrase: set SSH_ASKPASS or GIT_ASKPASS, or use ssh-add to load your key into the agent")
 }
 
 // run executes a command in the given directory, inheriting stderr.
