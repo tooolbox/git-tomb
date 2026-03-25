@@ -401,15 +401,21 @@ func (h *helper) fetchRemoteRefs() ([]string, error) {
 
 // forgivingIdentity wraps an age.Identity and converts any error during
 // Unwrap into age.ErrIncorrectIdentity, so that age continues trying
-// other identities instead of aborting.
+// other identities instead of aborting. Once a key fails, it remembers
+// and skips immediately on subsequent calls.
 type forgivingIdentity struct {
-	inner age.Identity
-	name  string
+	inner  age.Identity
+	name   string
+	failed bool
 }
 
 func (f *forgivingIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	if f.failed {
+		return nil, age.ErrIncorrectIdentity
+	}
 	fileKey, err := f.inner.Unwrap(stanzas)
 	if err != nil {
+		f.failed = true
 		fmt.Fprintf(os.Stderr, "tomb: key %s failed: %v, trying next key...\n", f.name, err)
 		return nil, age.ErrIncorrectIdentity
 	}
