@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"filippo.io/age"
@@ -481,26 +482,48 @@ func loadIdentities() ([]age.Identity, error) {
 	return identities, nil
 }
 
-// readPassphrase prompts for a passphrase on stderr and reads from the terminal.
+// readPassphrase prompts for a passphrase and reads from the terminal.
 // stdin is used by the git remote helper protocol, so we open the terminal directly.
+// Matches the approach used by age itself (filippo.io/age/internal/term).
 func readPassphrase(prompt string) ([]byte, error) {
-	fmt.Fprint(os.Stderr, prompt)
+	if runtime.GOOS == "windows" {
+		return readPassphraseWindows(prompt)
+	}
+	return readPassphraseUnix(prompt)
+}
 
-	// Open the terminal directly — stdin is taken by the git protocol.
-	// Try /dev/tty first (works on Unix and Git Bash/MSYS2 on Windows).
-	tty, err := os.Open("/dev/tty")
+func readPassphraseWindows(prompt string) ([]byte, error) {
+	// Open Windows console directly (bypasses mintty pipe layer).
+	in, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
 	if err != nil {
-		// Fall back to Windows console input.
-		tty, err = os.Open("CONIN$")
-		if err != nil {
-			return nil, fmt.Errorf("cannot open terminal for passphrase input: %w", err)
-		}
+		return nil, fmt.Errorf("cannot open console input: %w", err)
+	}
+	defer in.Close()
+
+	// Write prompt to console output so it appears where the user types.
+	out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
+	if err != nil {
+		fmt.Fprint(os.Stderr, prompt)
+	} else {
+		fmt.Fprint(out, prompt)
+		defer out.Close()
+	}
+
+	pass, err := term.ReadPassword(int(in.Fd()))
+	fmt.Fprintln(os.Stderr)
+	return pass, err
+}
+
+func readPassphraseUnix(prompt string) ([]byte, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open terminal: %w", err)
 	}
 	defer tty.Close()
 
-	fd := int(tty.Fd())
-	pass, err := term.ReadPassword(fd)
-	fmt.Fprintln(os.Stderr) // newline after passphrase
+	fmt.Fprint(tty, prompt)
+	pass, err := term.ReadPassword(int(tty.Fd()))
+	fmt.Fprintln(tty)
 	return pass, err
 }
 
