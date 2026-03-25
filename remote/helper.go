@@ -96,6 +96,21 @@ type helper struct {
 	remoteName string
 	url        string
 	gitDir     string
+
+	// cachedIdentities holds SSH identities loaded once per session.
+	cachedIdentities []age.Identity
+}
+
+func (h *helper) identities() ([]age.Identity, error) {
+	if h.cachedIdentities != nil {
+		return h.cachedIdentities, nil
+	}
+	ids, err := loadIdentities()
+	if err != nil {
+		return nil, err
+	}
+	h.cachedIdentities = ids
+	return ids, nil
 }
 
 func (h *helper) capabilities() error {
@@ -125,7 +140,7 @@ func (h *helper) list(forPush string) error {
 
 // fetch decrypts and unbundles objects from the remote.
 func (h *helper) fetch(refs []string) error {
-	identities, err := loadIdentities()
+	identities, err := h.identities()
 	if err != nil {
 		return fmt.Errorf("loading SSH keys: %w", err)
 	}
@@ -333,7 +348,7 @@ func (h *helper) localRefs() (string, error) {
 func (h *helper) fetchRemoteRefs() ([]string, error) {
 	fmt.Fprintf(os.Stderr, "tomb: fetching refs from %s\n", h.url)
 
-	identities, err := loadIdentities()
+	identities, err := h.identities()
 	if err != nil {
 		return nil, fmt.Errorf("loading identities: %w", err)
 	}
