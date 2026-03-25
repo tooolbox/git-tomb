@@ -395,31 +395,52 @@ func recipientsFromConfig(cfg *tomb.Config) ([]age.Recipient, error) {
 	return recipients, nil
 }
 
+// sshDir returns the .ssh directory, checking HOME env var first
+// (which bash/git-bash sets correctly) before falling back to
+// os.UserHomeDir() (which may differ on Windows).
+func sshDir() (string, error) {
+	if home := os.Getenv("HOME"); home != "" {
+		dir := filepath.Join(home, ".ssh")
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir, nil
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".ssh"), nil
+}
+
 // loadIdentities loads the user's SSH private keys for decryption.
 func loadIdentities() ([]age.Identity, error) {
-	home, err := os.UserHomeDir()
+	dir, err := sshDir()
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Fprintf(os.Stderr, "tomb: looking for SSH keys in %s\n", dir)
 
 	var identities []age.Identity
 	keyFiles := []string{"id_ed25519", "id_ecdsa", "id_rsa"}
 
 	for _, name := range keyFiles {
-		path := filepath.Join(home, ".ssh", name)
+		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 		id, err := agessh.ParseIdentity(data)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "tomb: skipping %s: %v\n", name, err)
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "tomb: loaded key %s\n", name)
 		identities = append(identities, id)
 	}
 
 	if len(identities) == 0 {
-		return nil, fmt.Errorf("no SSH keys found in ~/.ssh/ (looked for %s)", strings.Join(keyFiles, ", "))
+		return nil, fmt.Errorf("no SSH keys found in %s (looked for %s)", dir, strings.Join(keyFiles, ", "))
 	}
 
 	return identities, nil
