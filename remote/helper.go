@@ -105,11 +105,14 @@ func (h *helper) capabilities() error {
 func (h *helper) list(forPush string) error {
 	refs, err := h.fetchRemoteRefs()
 	if err != nil {
-		// No refs yet (empty remote) — return empty list.
+		// Could be an empty remote, or could be an actual error.
+		// Log to stderr so the user can see what's happening.
+		fmt.Fprintf(os.Stderr, "tomb: list refs: %v\n", err)
 		fmt.Println()
 		return nil
 	}
 	for _, ref := range refs {
+		fmt.Fprintf(os.Stderr, "tomb: ref: %s\n", ref)
 		fmt.Println(ref)
 	}
 	fmt.Println()
@@ -324,10 +327,13 @@ func (h *helper) localRefs() (string, error) {
 }
 
 func (h *helper) fetchRemoteRefs() ([]string, error) {
+	fmt.Fprintf(os.Stderr, "tomb: fetching refs from %s\n", h.url)
+
 	identities, err := loadIdentities()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("loading identities: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "tomb: loaded %d SSH identities\n", len(identities))
 
 	// Shallow clone the remote to get the encrypted refs file.
 	tmpDir, err := os.MkdirTemp("", "tomb-refs-*")
@@ -339,22 +345,34 @@ func (h *helper) fetchRemoteRefs() ([]string, error) {
 	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("fetching remote: %w", err)
+		return nil, fmt.Errorf("cloning remote: %w", err)
+	}
+
+	// List what we got.
+	entries, _ := os.ReadDir(tmpDir)
+	for _, e := range entries {
+		if e.Name() != ".git" {
+			fmt.Fprintf(os.Stderr, "tomb: found file: %s\n", e.Name())
+		}
 	}
 
 	refsPath := filepath.Join(tmpDir, "tomb.refs.age")
 	encData, err := os.ReadFile(refsPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading refs file: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "tomb: encrypted refs file: %d bytes\n", len(encData))
 
 	var sb strings.Builder
 	if err := crypt.Decrypt(&sb, bytes.NewReader(encData), identities); err != nil {
 		return nil, fmt.Errorf("decrypting refs: %w", err)
 	}
 
+	decrypted := sb.String()
+	fmt.Fprintf(os.Stderr, "tomb: decrypted refs:\n%s", decrypted)
+
 	var refs []string
-	for _, line := range strings.Split(strings.TrimSpace(sb.String()), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(decrypted), "\n") {
 		if line != "" {
 			refs = append(refs, line)
 		}
