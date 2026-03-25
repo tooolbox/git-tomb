@@ -6,8 +6,8 @@ package remote
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,12 +102,10 @@ func (h *helper) capabilities() error {
 }
 
 // list reports the refs available on the remote.
-// We store encrypted bundles, so we need to fetch and decrypt the ref list.
 func (h *helper) list(forPush string) error {
-	// Try to fetch the encrypted ref list from the remote.
 	refs, err := h.fetchRemoteRefs()
 	if err != nil {
-		// No refs yet (empty remote) — just return empty list.
+		// No refs yet (empty remote) — return empty list.
 		fmt.Println()
 		return nil
 	}
@@ -125,21 +123,20 @@ func (h *helper) fetch(refs []string) error {
 		return fmt.Errorf("loading SSH keys: %w", err)
 	}
 
-	// Clone the encrypted remote into a temp dir.
+	// Clone the encrypted remote into a temp dir (regular clone to get working tree files).
 	tmpDir, err := os.MkdirTemp("", "tomb-fetch-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Git clone the actual remote (which has encrypted data).
-	cmd := exec.Command("git", "clone", "--bare", "--quiet", h.url, tmpDir)
+	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("cloning encrypted remote: %w", err)
 	}
 
-	// Read the encrypted bundle.
+	// Read the encrypted bundle from the working tree.
 	bundlePath := filepath.Join(tmpDir, "tomb.bundle.age")
 	encData, err := os.ReadFile(bundlePath)
 	if err != nil {
@@ -153,14 +150,14 @@ func (h *helper) fetch(refs []string) error {
 	}
 	defer os.Remove(decBundle.Name())
 
-	if err := crypt.Decrypt(decBundle, strings.NewReader(string(encData)), identities); err != nil {
+	if err := crypt.Decrypt(decBundle, bytes.NewReader(encData), identities); err != nil {
 		return fmt.Errorf("decrypting bundle: %w", err)
 	}
 	decBundle.Close()
 
-	// Unbundle into the local repo.
-	cmd = exec.Command("git", "bundle", "unbundle", decBundle.Name())
-	cmd.Dir = h.repoDir()
+	// Unbundle into the local repo using GIT_DIR directly.
+	absGitDir, _ := filepath.Abs(h.gitDir)
+	cmd = exec.Command("git", "--git-dir", absGitDir, "bundle", "unbundle", decBundle.Name())
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("unbundling: %w", err)
@@ -183,7 +180,7 @@ func (h *helper) push(specs []string) error {
 	}
 
 	if len(cfg.Recipients) == 0 {
-		return fmt.Errorf("no recipients configured — run 'tomb add <provider> <username>' first")
+		return fmt.Errorf("no recipients configured — run 'git tomb add <provider> <username>' first")
 	}
 
 	recipients, err := recipientsFromConfig(cfg)
@@ -206,7 +203,7 @@ func (h *helper) push(specs []string) error {
 		return fmt.Errorf("creating bundle: %w", err)
 	}
 
-	// Read the bundle and encrypt it.
+	// Encrypt the bundle.
 	bundleData, err := os.ReadFile(bundleFile.Name())
 	if err != nil {
 		return err
@@ -218,92 +215,63 @@ func (h *helper) push(specs []string) error {
 	}
 	defer os.Remove(encFile.Name())
 
-	if err := crypt.Encrypt(encFile, strings.NewReader(string(bundleData)), recipients); err != nil {
+	if err := crypt.Encrypt(encFile, bytes.NewReader(bundleData), recipients); err != nil {
 		return fmt.Errorf("encrypting bundle: %w", err)
 	}
 	encFile.Close()
 
-	// Push the encrypted bundle to the actual remote.
-	// We create a temporary bare repo, put the encrypted file in it, and push.
-	tmpDir, err := os.MkdirTemp("", "tomb-push-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Init bare repo.
-	cmd = exec.Command("git", "init", "--bare", "--quiet", tmpDir)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("creating temp repo: %w", err)
-	}
-
-	// Copy encrypted bundle into the bare repo.
-	encData, err := os.ReadFile(encFile.Name())
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "tomb.bundle.age"), encData, 0o644); err != nil {
-		return err
-	}
-
-	// Also store an encrypted ref list so 'list' can work without full decrypt.
+	// Encrypt the ref list.
 	refList, err := h.localRefs()
 	if err != nil {
 		return err
 	}
-	refFile, err := os.CreateTemp("", "tomb-refs-*.age")
+
+	encRefsFile, err := os.CreateTemp("", "tomb-refs-*.age")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(refFile.Name())
+	defer os.Remove(encRefsFile.Name())
 
-	if err := crypt.Encrypt(refFile, strings.NewReader(refList), recipients); err != nil {
+	if err := crypt.Encrypt(encRefsFile, strings.NewReader(refList), recipients); err != nil {
 		return fmt.Errorf("encrypting refs: %w", err)
 	}
-	refFile.Close()
+	encRefsFile.Close()
 
-	refData, err := os.ReadFile(refFile.Name())
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "tomb.refs.age"), refData, 0o644); err != nil {
-		return err
-	}
-
-	// Commit and push.
-	cmd = exec.Command("git", "-C", tmpDir, "config", "user.email", "tomb@localhost")
-	cmd.Run()
-	cmd = exec.Command("git", "-C", tmpDir, "config", "user.name", "tomb")
-	cmd.Run()
-
-	// We need a working tree to commit. Use a temp worktree approach.
-	workDir, err := os.MkdirTemp("", "tomb-work-*")
+	// Create a temp working directory, commit encrypted files, and push to the real remote.
+	workDir, err := os.MkdirTemp("", "tomb-push-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(workDir)
 
-	cmd = exec.Command("git", "clone", "--quiet", tmpDir, workDir)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cloning temp repo: %w", err)
+	// Init a fresh repo in the work dir.
+	if err := run(workDir, "git", "init", "--quiet"); err != nil {
+		return fmt.Errorf("init temp repo: %w", err)
+	}
+	if err := run(workDir, "git", "config", "user.email", "tomb@localhost"); err != nil {
+		return err
+	}
+	if err := run(workDir, "git", "config", "user.name", "tomb"); err != nil {
+		return err
 	}
 
-	// Copy files into work dir.
-	for _, name := range []string{"tomb.bundle.age", "tomb.refs.age"} {
-		data, _ := os.ReadFile(filepath.Join(tmpDir, name))
-		os.WriteFile(filepath.Join(workDir, name), data, 0o644)
+	// Copy encrypted files into the work dir.
+	encData, _ := os.ReadFile(encFile.Name())
+	os.WriteFile(filepath.Join(workDir, "tomb.bundle.age"), encData, 0o644)
+
+	encRefsData, _ := os.ReadFile(encRefsFile.Name())
+	os.WriteFile(filepath.Join(workDir, "tomb.refs.age"), encRefsData, 0o644)
+
+	// Commit.
+	if err := run(workDir, "git", "add", "-A"); err != nil {
+		return err
+	}
+	if err := run(workDir, "git", "commit", "--quiet", "-m", "tomb: encrypted update"); err != nil {
+		return fmt.Errorf("committing encrypted data: %w", err)
 	}
 
-	cmd = exec.Command("git", "-C", workDir, "add", "-A")
-	cmd.Run()
-	cmd = exec.Command("git", "-C", workDir, "commit", "-m", "tomb: encrypted update", "--allow-empty")
-	cmd.Stderr = os.Stderr
-	cmd.Run()
-
-	// Force push to actual remote.
-	cmd = exec.Command("git", "-C", workDir, "push", "--force", "--quiet", h.url, "HEAD:refs/heads/main")
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	// Force push to the actual remote.
+	if err := run(workDir, "git", "push", "--force", "--quiet", h.url, "HEAD:refs/heads/main"); err != nil {
 		return fmt.Errorf("pushing to remote: %w", err)
 	}
 
@@ -320,7 +288,6 @@ func (h *helper) push(specs []string) error {
 }
 
 func (h *helper) repoDir() string {
-	// GIT_DIR is typically .git — the repo root is its parent.
 	abs, _ := filepath.Abs(h.gitDir)
 	if filepath.Base(abs) == ".git" {
 		return filepath.Dir(abs)
@@ -345,7 +312,7 @@ func (h *helper) localRefs() (string, error) {
 		sb.WriteString("\n")
 	}
 
-	// Also get HEAD.
+	// Get HEAD symref.
 	cmd = exec.Command("git", "symbolic-ref", "HEAD")
 	cmd.Dir = h.repoDir()
 	headOut, err := cmd.Output()
@@ -362,17 +329,17 @@ func (h *helper) fetchRemoteRefs() ([]string, error) {
 		return nil, err
 	}
 
-	// Fetch just the refs file from the remote using git archive or a shallow clone.
+	// Shallow clone the remote to get the encrypted refs file.
 	tmpDir, err := os.MkdirTemp("", "tomb-refs-*")
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.Command("git", "clone", "--bare", "--quiet", "--depth=1", h.url, tmpDir)
-	cmd.Stderr = io.Discard
+	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
+	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("fetching remote refs: %w", err)
+		return nil, fmt.Errorf("fetching remote: %w", err)
 	}
 
 	refsPath := filepath.Join(tmpDir, "tomb.refs.age")
@@ -382,7 +349,7 @@ func (h *helper) fetchRemoteRefs() ([]string, error) {
 	}
 
 	var sb strings.Builder
-	if err := crypt.Decrypt(&sb, strings.NewReader(string(encData)), identities); err != nil {
+	if err := crypt.Decrypt(&sb, bytes.NewReader(encData), identities); err != nil {
 		return nil, fmt.Errorf("decrypting refs: %w", err)
 	}
 
@@ -418,17 +385,17 @@ func loadIdentities() ([]age.Identity, error) {
 	}
 
 	var identities []age.Identity
-	keyFiles := []string{"id_ed25519", "id_rsa"}
+	keyFiles := []string{"id_ed25519", "id_ecdsa", "id_rsa"}
 
 	for _, name := range keyFiles {
 		path := filepath.Join(home, ".ssh", name)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			continue // Key file doesn't exist, skip.
+			continue
 		}
 		id, err := agessh.ParseIdentity(data)
 		if err != nil {
-			continue // Not a supported key type, skip.
+			continue
 		}
 		identities = append(identities, id)
 	}
@@ -438,4 +405,12 @@ func loadIdentities() ([]age.Identity, error) {
 	}
 
 	return identities, nil
+}
+
+// run executes a command in the given directory, inheriting stderr.
+func run(dir string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
