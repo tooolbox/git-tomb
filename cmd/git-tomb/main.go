@@ -9,6 +9,9 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +21,7 @@ import (
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/tooolbox/git-tomb/keys"
 	_ "github.com/tooolbox/git-tomb/keys" // Register providers.
@@ -43,6 +47,8 @@ func main() {
 		cmdRefresh()
 	case "config":
 		cmdConfig(os.Args[2:])
+	case "keygen":
+		cmdKeygen(os.Args[2:])
 	case "version", "--version", "-v":
 		cmdVersion()
 	case "help", "--help", "-h":
@@ -64,6 +70,7 @@ Commands:
   list                                  List all recipients
   refresh                               Re-fetch keys for all recipients
   config [key] [value]                  View or set configuration
+  keygen [path]                         Generate an ed25519 SSH keypair
 
 Providers: github, gitlab, file
 
@@ -538,6 +545,76 @@ func cmdConfig(args []string) {
 	default:
 		fatal("usage: git tomb config [key] [value]")
 	}
+}
+
+func cmdKeygen(args []string) {
+	// Determine output path.
+	var keyPath string
+	switch len(args) {
+	case 0:
+		// Default: ~/.ssh/id_ed25519
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal("finding home directory: %v", err)
+		}
+		keyPath = filepath.Join(home, ".ssh", "id_ed25519")
+	case 1:
+		keyPath = args[0]
+	default:
+		fatal("usage: git tomb keygen [path]")
+	}
+
+	pubPath := keyPath + ".pub"
+
+	// Check if keys already exist.
+	if _, err := os.Stat(keyPath); err == nil {
+		fatal("key already exists: %s\nRemove it first or specify a different path.", keyPath)
+	}
+	if _, err := os.Stat(pubPath); err == nil {
+		fatal("public key already exists: %s\nRemove it first or specify a different path.", pubPath)
+	}
+
+	// Generate ed25519 keypair.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		fatal("generating key: %v", err)
+	}
+
+	// Marshal public key to authorized_keys format.
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		fatal("creating SSH public key: %v", err)
+	}
+	pubKeyStr := string(ssh.MarshalAuthorizedKey(sshPub))
+
+	// Marshal private key to OpenSSH PEM format.
+	privPEM, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		fatal("marshaling private key: %v", err)
+	}
+	privKeyData := pem.EncodeToMemory(privPEM)
+
+	// Ensure the directory exists.
+	dir := filepath.Dir(keyPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fatal("creating directory %s: %v", dir, err)
+	}
+
+	// Write the keys.
+	if err := os.WriteFile(keyPath, privKeyData, 0o600); err != nil {
+		fatal("writing private key: %v", err)
+	}
+	if err := os.WriteFile(pubPath, []byte(pubKeyStr), 0o644); err != nil {
+		fatal("writing public key: %v", err)
+	}
+
+	// Compute fingerprint.
+	fp := ssh.FingerprintSHA256(sshPub)
+
+	fmt.Printf("Generated ed25519 SSH keypair:\n")
+	fmt.Printf("  Private: %s\n", keyPath)
+	fmt.Printf("  Public:  %s\n", pubPath)
+	fmt.Printf("  Fingerprint: %s\n", fp)
 }
 
 func cmdVersion() {

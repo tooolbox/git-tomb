@@ -108,6 +108,8 @@ git tomb config scramble keep-filenames
 | `git tomb config` | Show all configuration |
 | `git tomb config <key>` | Get a config value |
 | `git tomb config <key> <value>` | Set a config value |
+| `git tomb keygen` | Generate an ed25519 SSH keypair in `~/.ssh/` |
+| `git tomb keygen <path>` | Generate an ed25519 SSH keypair at a custom path |
 
 **Providers:** `github`, `gitlab`, `file`
 
@@ -134,4 +136,4 @@ When you add or remove recipients, the shared secret (per-file mode) is automati
 
 - Go 1.21+
 - Git
-- An SSH key (ed25519 or RSA) in `~/.ssh/`
+- An SSH key (ed25519 or RSA) in `~/.ssh/` — if you don't have one and don't have `ssh-keygen`, run `git tomb keygen`
