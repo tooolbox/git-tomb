@@ -2,6 +2,10 @@
 //
 // Git invokes git-remote-tomb when it encounters a URL like tomb::https://github.com/user/repo.git
 // The helper speaks the fetch/push remote helper protocol over stdin/stdout.
+//
+// The remote repository is a normal git repo containing encrypted files with
+// scrambled filenames. Anyone can clone it and see the files — but the content
+// and names are only meaningful to recipients who hold the correct keys.
 package remote
 
 import (
@@ -122,83 +126,187 @@ func (h *helper) capabilities() error {
 
 // list reports the refs available on the remote.
 func (h *helper) list(forPush string) error {
-	refs, err := h.fetchRemoteRefs()
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundleList(forPush)
+	}
+	return h.perFileList(forPush)
+}
+
+// perFileList reports refs for per-file mode by ls-remote + unscrambling.
+func (h *helper) perFileList(forPush string) error {
+	cmd := exec.Command("git", "ls-remote", h.url)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
 	if err != nil {
-		// Could be an empty remote, or could be an actual error.
-		// Log to stderr so the user can see what's happening.
 		fmt.Fprintf(os.Stderr, "tomb: list refs: %v\n", err)
 		fmt.Println()
 		return nil
 	}
-	for _, ref := range refs {
-		fmt.Fprintf(os.Stderr, "tomb: ref: %s\n", ref)
-		fmt.Println(ref)
+
+	root, cfg, secret, err := h.loadTombState()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tomb: warning: could not load tomb config: %v\n", err)
+		fmt.Print(string(out))
+		fmt.Println()
+		return nil
 	}
+	_ = root
+
+	refMap := h.buildRefMap(cfg, secret)
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		sha := parts[0]
+		ref := parts[1]
+
+		if orig, ok := refMap[ref]; ok {
+			ref = orig
+		}
+
+		fmt.Fprintf(os.Stderr, "tomb: ref: %s %s\n", sha, ref)
+		fmt.Printf("%s %s\n", sha, ref)
+	}
+
 	fmt.Println()
 	return nil
 }
 
-// fetch decrypts and unbundles objects from the remote.
+// encryptionMode reads the config to determine bundle vs per-file mode.
+func (h *helper) encryptionMode() tomb.EncryptionMode {
+	root, err := tomb.FindRoot(h.repoDir())
+	if err != nil {
+		return tomb.EncryptionBundle // safe fallback for legacy repos
+	}
+	cfg, err := tomb.LoadConfig(root)
+	if err != nil {
+		return tomb.EncryptionBundle
+	}
+	if cfg.Encryption == "" {
+		return tomb.EncryptionBundle
+	}
+	return cfg.Encryption
+}
+
+// fetch dispatches to the appropriate fetch implementation.
 func (h *helper) fetch(refs []string) error {
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundleFetch(refs)
+	}
+	return h.perFileFetch(refs)
+}
+
+// push dispatches to the appropriate push implementation.
+func (h *helper) push(specs []string) error {
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundlePush(specs)
+	}
+	return h.perFilePush(specs)
+}
+
+// perFileFetch decrypts commits from the remote and injects plaintext objects locally.
+func (h *helper) perFileFetch(refs []string) error {
 	identities, err := h.identities()
 	if err != nil {
 		return fmt.Errorf("loading SSH keys: %w", err)
 	}
 
-	// Clone the encrypted remote into a temp dir (regular clone to get working tree files).
+	root, cfg, secret, err := h.loadTombState()
+	if err != nil {
+		return fmt.Errorf("loading tomb state: %w", err)
+	}
+
+	recipients, err := recipientsFromConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("parsing recipients: %w", err)
+	}
+
+	// Fetch the encrypted objects from the remote into a temp bare repo.
 	tmpDir, err := os.MkdirTemp("", "tomb-fetch-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cloning encrypted remote: %w", err)
+	if err := run(tmpDir, "git", "init", "--bare", "--quiet"); err != nil {
+		return fmt.Errorf("init temp repo: %w", err)
 	}
 
-	// Read the encrypted bundle from the working tree.
-	bundlePath := filepath.Join(tmpDir, "tomb.bundle.age")
-	encData, err := os.ReadFile(bundlePath)
+	// Fetch all refs from the remote.
+	if err := run(tmpDir, "git", "fetch", "--quiet", h.url, "+refs/*:refs/*"); err != nil {
+		return fmt.Errorf("fetching remote: %w", err)
+	}
+
+	cm, err := loadCommitMap(root)
 	if err != nil {
-		return fmt.Errorf("reading encrypted bundle: %w", err)
+		return fmt.Errorf("loading commit map: %w", err)
 	}
 
-	// Decrypt the bundle to a temp file.
-	decBundle, err := os.CreateTemp("", "tomb-bundle-*.bundle")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(decBundle.Name())
-
-	if err := crypt.Decrypt(decBundle, bytes.NewReader(encData), identities); err != nil {
-		return fmt.Errorf("decrypting bundle: %w", err)
-	}
-	decBundle.Close()
-
-	// Unbundle into the local repo using GIT_DIR directly.
 	absGitDir, _ := filepath.Abs(h.gitDir)
-	cmd = exec.Command("git", "--git-dir", absGitDir, "bundle", "unbundle", decBundle.Name())
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("unbundling: %w", err)
+	mode := crypt.ScrambleMode(cfg.Scramble)
+	if mode == "" {
+		mode = crypt.ScrambleFull
+	}
+
+	rw := &rewriter{
+		secret:      secret,
+		recipients:  recipients,
+		identities:  identities,
+		mode:        mode,
+		cm:          cm,
+		workDir:     tmpDir,
+		localGitDir: absGitDir,
+	}
+
+	// For each ref the user wants to fetch, translate the commit chain.
+	for _, ref := range refs {
+		// ref is like "sha refname" — we need the sha.
+		sha := strings.Fields(ref)[0]
+
+		// The SHA from the remote points to an encrypted commit.
+		// We need to find the corresponding remote SHA in our temp repo.
+		// The ref in our temp repo might be scrambled.
+		fmt.Fprintf(os.Stderr, "tomb: decrypting commit %s...\n", sha[:8])
+
+		localSHA, err := rw.decryptCommit(sha)
+		if err != nil {
+			return fmt.Errorf("decrypting commit %s: %w", sha[:8], err)
+		}
+
+		// Update local ref to point to the decrypted commit.
+		refName := ""
+		parts := strings.Fields(ref)
+		if len(parts) >= 2 {
+			refName = parts[1]
+		}
+		if refName != "" {
+			if err := rw.updateRef(absGitDir, refName, localSHA); err != nil {
+				return fmt.Errorf("updating ref %s: %w", refName, err)
+			}
+		}
+	}
+
+	if err := saveCommitMap(root, cm); err != nil {
+		fmt.Fprintf(os.Stderr, "tomb: warning: could not save commit map: %v\n", err)
 	}
 
 	fmt.Println()
 	return nil
 }
 
-// push bundles, encrypts, and pushes to the remote.
-func (h *helper) push(specs []string) error {
-	root, err := tomb.FindRoot(h.repoDir())
+// perFilePush encrypts local commits and pushes them to the remote.
+func (h *helper) perFilePush(specs []string) error {
+	root, cfg, secret, err := h.loadTombState()
 	if err != nil {
-		return err
-	}
-
-	cfg, err := tomb.LoadConfig(root)
-	if err != nil {
-		return err
+		return fmt.Errorf("loading tomb state: %w", err)
 	}
 
 	if len(cfg.Recipients) == 0 {
@@ -210,103 +318,166 @@ func (h *helper) push(specs []string) error {
 		return err
 	}
 
-	// Create a bundle of the entire repo.
-	bundleFile, err := os.CreateTemp("", "tomb-bundle-*.bundle")
+	identities, err := h.identities()
+	if err != nil {
+		return fmt.Errorf("loading SSH keys: %w", err)
+	}
+
+	cm, err := loadCommitMap(root)
+	if err != nil {
+		return fmt.Errorf("loading commit map: %w", err)
+	}
+
+	// Create a temp bare repo for staging encrypted objects.
+	tmpDir, err := os.MkdirTemp("", "tomb-push-*")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(bundleFile.Name())
-	bundleFile.Close()
+	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.Command("git", "bundle", "create", bundleFile.Name(), "--all")
-	cmd.Dir = h.repoDir()
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("creating bundle: %w", err)
-	}
-
-	// Encrypt the bundle.
-	bundleData, err := os.ReadFile(bundleFile.Name())
-	if err != nil {
-		return err
-	}
-
-	encFile, err := os.CreateTemp("", "tomb-encrypted-*.age")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(encFile.Name())
-
-	if err := crypt.Encrypt(encFile, bytes.NewReader(bundleData), recipients); err != nil {
-		return fmt.Errorf("encrypting bundle: %w", err)
-	}
-	encFile.Close()
-
-	// Encrypt the ref list.
-	refList, err := h.localRefs()
-	if err != nil {
-		return err
-	}
-
-	encRefsFile, err := os.CreateTemp("", "tomb-refs-*.age")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(encRefsFile.Name())
-
-	if err := crypt.Encrypt(encRefsFile, strings.NewReader(refList), recipients); err != nil {
-		return fmt.Errorf("encrypting refs: %w", err)
-	}
-	encRefsFile.Close()
-
-	// Create a temp working directory, commit encrypted files, and push to the real remote.
-	workDir, err := os.MkdirTemp("", "tomb-push-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(workDir)
-
-	// Init a fresh repo in the work dir.
-	if err := run(workDir, "git", "init", "--quiet"); err != nil {
+	if err := run(tmpDir, "git", "init", "--bare", "--quiet"); err != nil {
 		return fmt.Errorf("init temp repo: %w", err)
 	}
-	if err := run(workDir, "git", "config", "user.email", "tomb@localhost"); err != nil {
-		return err
-	}
-	if err := run(workDir, "git", "config", "user.name", "tomb"); err != nil {
-		return err
-	}
 
-	// Copy encrypted files into the work dir.
-	encData, _ := os.ReadFile(encFile.Name())
-	os.WriteFile(filepath.Join(workDir, "tomb.bundle.age"), encData, 0o644)
-
-	encRefsData, _ := os.ReadFile(encRefsFile.Name())
-	os.WriteFile(filepath.Join(workDir, "tomb.refs.age"), encRefsData, 0o644)
-
-	// Commit.
-	if err := run(workDir, "git", "add", "-A"); err != nil {
-		return err
-	}
-	if err := run(workDir, "git", "commit", "--quiet", "-m", "tomb: encrypted update"); err != nil {
-		return fmt.Errorf("committing encrypted data: %w", err)
+	absGitDir, _ := filepath.Abs(h.gitDir)
+	mode := crypt.ScrambleMode(cfg.Scramble)
+	if mode == "" {
+		mode = crypt.ScrambleFull
 	}
 
-	// Force push to the actual remote.
-	if err := run(workDir, "git", "push", "--force", "--quiet", h.url, "HEAD:refs/heads/main"); err != nil {
-		return fmt.Errorf("pushing to remote: %w", err)
+	rw := &rewriter{
+		secret:      secret,
+		recipients:  recipients,
+		identities:  identities,
+		mode:        mode,
+		cm:          cm,
+		workDir:     tmpDir,
+		localGitDir: absGitDir,
 	}
 
-	// Report success for each push spec.
+	// Fetch existing remote objects so we can do incremental push.
+	// Non-fatal if remote is empty.
+	fetchCmd := exec.Command("git", "fetch", "--quiet", h.url, "+refs/*:refs/*")
+	fetchCmd.Dir = tmpDir
+	fetchCmd.Stderr = os.Stderr
+	fetchCmd.Run() // ignore error — remote might be empty
+
+	// Process each push spec.
 	for _, spec := range specs {
-		dst := spec
-		if idx := strings.Index(spec, ":"); idx >= 0 {
-			dst = spec[idx+1:]
+		src, dst, _ := strings.Cut(spec, ":")
+		if src == "" {
+			// Delete ref — not supported yet.
+			fmt.Printf("error %s unsupported delete\n", dst)
+			continue
 		}
+
+		// Resolve the local ref to a SHA.
+		localSHA, err := rw.resolveRef(absGitDir, src)
+		if err != nil {
+			fmt.Printf("error %s %v\n", dst, err)
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "tomb: encrypting commit %s for %s...\n", localSHA[:8], dst)
+
+		remoteSHA, err := rw.encryptCommit(localSHA)
+		if err != nil {
+			fmt.Printf("error %s %v\n", dst, err)
+			continue
+		}
+
+		// Scramble the destination ref name.
+		scrambledDst := crypt.ScrambleRef(secret, dst)
+		fmt.Fprintf(os.Stderr, "tomb: %s → %s (sha %s)\n", dst, scrambledDst, remoteSHA[:8])
+
+		// Update the ref in the temp repo.
+		if err := rw.updateRef(tmpDir, scrambledDst, remoteSHA); err != nil {
+			fmt.Printf("error %s %v\n", dst, err)
+			continue
+		}
+
+		// Push this ref to the remote.
+		pushCmd := exec.Command("git", "push", h.url, scrambledDst+":"+scrambledDst)
+		pushCmd.Dir = tmpDir
+		pushCmd.Stderr = os.Stderr
+		if err := pushCmd.Run(); err != nil {
+			fmt.Printf("error %s push failed: %v\n", dst, err)
+			continue
+		}
+
 		fmt.Printf("ok %s\n", dst)
 	}
+
+	if err := saveCommitMap(root, cm); err != nil {
+		fmt.Fprintf(os.Stderr, "tomb: warning: could not save commit map: %v\n", err)
+	}
+
 	fmt.Println()
 	return nil
+}
+
+// loadTombState loads the config, secret, and identities needed for operations.
+func (h *helper) loadTombState() (root string, cfg *tomb.Config, secret []byte, err error) {
+	root, err = tomb.FindRoot(h.repoDir())
+	if err != nil {
+		return
+	}
+
+	cfg, err = tomb.LoadConfig(root)
+	if err != nil {
+		return
+	}
+
+	identities, err := h.identities()
+	if err != nil {
+		return
+	}
+
+	secret, err = tomb.LoadSecret(root, identities)
+	return
+}
+
+// buildRefMap builds a scrambled→original ref mapping for all known local refs.
+func (h *helper) buildRefMap(cfg *tomb.Config, secret []byte) map[string]string {
+	refMap := make(map[string]string)
+
+	// Get local refs and compute their scrambled equivalents.
+	cmd := exec.Command("git", "show-ref")
+	cmd.Dir = h.repoDir()
+	out, err := cmd.Output()
+	if err != nil {
+		return refMap
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		ref := parts[1]
+		scrambled := crypt.ScrambleRef(secret, ref)
+		refMap[scrambled] = ref
+	}
+
+	return refMap
+}
+
+func (rw *rewriter) resolveRef(gitDir, ref string) (string, error) {
+	out, err := rw.gitOutput(gitDir, "rev-parse", ref)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s: %w", ref, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (rw *rewriter) updateRef(gitDir, ref, sha string) error {
+	cmd := exec.Command("git", "update-ref", ref, sha)
+	cmd.Dir = gitDir
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func (h *helper) repoDir() string {
@@ -315,88 +486,6 @@ func (h *helper) repoDir() string {
 		return filepath.Dir(abs)
 	}
 	return abs
-}
-
-func (h *helper) localRefs() (string, error) {
-	cmd := exec.Command("git", "show-ref")
-	cmd.Dir = h.repoDir()
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-
-	var sb strings.Builder
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		sb.WriteString(line)
-		sb.WriteString("\n")
-	}
-
-	// Get HEAD symref.
-	cmd = exec.Command("git", "symbolic-ref", "HEAD")
-	cmd.Dir = h.repoDir()
-	headOut, err := cmd.Output()
-	if err == nil {
-		sb.WriteString("@" + strings.TrimSpace(string(headOut)) + " HEAD\n")
-	}
-
-	return sb.String(), nil
-}
-
-func (h *helper) fetchRemoteRefs() ([]string, error) {
-	fmt.Fprintf(os.Stderr, "tomb: fetching refs from %s\n", h.url)
-
-	identities, err := h.identities()
-	if err != nil {
-		return nil, fmt.Errorf("loading identities: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "tomb: loaded %d SSH identities\n", len(identities))
-
-	// Shallow clone the remote to get the encrypted refs file.
-	tmpDir, err := os.MkdirTemp("", "tomb-refs-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("cloning remote: %w", err)
-	}
-
-	// List what we got.
-	entries, _ := os.ReadDir(tmpDir)
-	for _, e := range entries {
-		if e.Name() != ".git" {
-			fmt.Fprintf(os.Stderr, "tomb: found file: %s\n", e.Name())
-		}
-	}
-
-	refsPath := filepath.Join(tmpDir, "tomb.refs.age")
-	encData, err := os.ReadFile(refsPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading refs file: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "tomb: encrypted refs file: %d bytes\n", len(encData))
-
-	var sb strings.Builder
-	if err := crypt.Decrypt(&sb, bytes.NewReader(encData), identities); err != nil {
-		return nil, fmt.Errorf("decrypting refs: %w", err)
-	}
-
-	decrypted := sb.String()
-	fmt.Fprintf(os.Stderr, "tomb: decrypted refs:\n%s", decrypted)
-
-	var refs []string
-	for _, line := range strings.Split(strings.TrimSpace(decrypted), "\n") {
-		if line != "" {
-			refs = append(refs, line)
-		}
-	}
-	return refs, nil
 }
 
 // forgivingIdentity wraps an age.Identity and converts any error during
