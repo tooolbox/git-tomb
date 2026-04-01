@@ -67,18 +67,22 @@ Commands:
 
 Providers: github, gitlab, file
 
-Init options:
+Encryption modes (required for init):
+  --encryption=bundle         Encrypt entire repo as a single blob (max privacy)
+  --encryption=per-file       Encrypt each file individually (incremental push/pull)
+
+Scramble options (per-file mode only):
   --scramble=full             Scramble filenames and extensions (default)
   --scramble=keep-extensions  Scramble filenames, keep extensions (.go, .js, etc.)
   --scramble=keep-filenames   Scramble directories only, keep original filenames
 
 Init examples:
-  git tomb init                                           # auto-discover local keys
-  git tomb init github mmccullough                        # use GitHub SSH keys
-  git tomb init --scramble=keep-extensions github alice    # keep extensions visible
+  git tomb init --encryption=bundle github mmccullough
+  git tomb init --encryption=per-file github mmccullough
+  git tomb init --encryption=per-file --scramble=keep-extensions github alice
 
 Workflow:
-  git tomb init github mmccullough
+  git tomb init --encryption=per-file github mmccullough
   git tomb add github joeblow
   git remote add origin tomb::https://github.com/user/repo.git
   git push origin main
@@ -100,11 +104,20 @@ func cmdInit(args []string) {
 		fatal("tomb is already initialized in this repository")
 	}
 
-	// Parse --scramble flag from args.
+	// Parse --encryption and --scramble flags from args.
+	var encryptionMode tomb.EncryptionMode
 	scrambleMode := tomb.ScrambleFull
 	var remaining []string
 	for _, a := range args {
-		if strings.HasPrefix(a, "--scramble=") {
+		if strings.HasPrefix(a, "--encryption=") {
+			val := strings.TrimPrefix(a, "--encryption=")
+			switch tomb.EncryptionMode(val) {
+			case tomb.EncryptionBundle, tomb.EncryptionPerFile:
+				encryptionMode = tomb.EncryptionMode(val)
+			default:
+				fatal("unknown encryption mode: %s (use bundle or per-file)", val)
+			}
+		} else if strings.HasPrefix(a, "--scramble=") {
 			val := strings.TrimPrefix(a, "--scramble=")
 			switch tomb.ScrambleMode(val) {
 			case tomb.ScrambleFull, tomb.ScrambleKeepExtensions, tomb.ScrambleKeepFilenames:
@@ -117,6 +130,14 @@ func cmdInit(args []string) {
 		}
 	}
 	args = remaining
+
+	if encryptionMode == "" {
+		fatal("--encryption is required\n  --encryption=bundle     encrypt entire repo as a single blob (max privacy)\n  --encryption=per-file   encrypt each file individually (incremental push/pull)")
+	}
+
+	if encryptionMode == tomb.EncryptionBundle && scrambleMode != tomb.ScrambleFull {
+		fatal("--scramble is only supported with --encryption=per-file")
+	}
 
 	// Determine how to get keys.
 	var provider string
@@ -153,7 +174,7 @@ func cmdInit(args []string) {
 			fatal("failed to fetch keys: %v", err)
 		}
 	default:
-		fatal("usage: git tomb init [--scramble=MODE] [provider username]")
+		fatal("usage: git tomb init --encryption=MODE [--scramble=MODE] [provider username]")
 	}
 
 	if len(fetchedKeys) == 0 {
@@ -182,28 +203,35 @@ func cmdInit(args []string) {
 				Keys:     pinned,
 			},
 		},
-		Scramble: scrambleMode,
+		Encryption: encryptionMode,
+		Scramble:   scrambleMode,
 	}
 
 	if err := tomb.SaveConfig(gitRoot, cfg); err != nil {
 		fatal("saving config: %v", err)
 	}
 
-	// Generate the symmetric secret and encrypt it for the initial recipients.
-	var ageRecipients []age.Recipient
-	for _, k := range fetchedKeys {
-		rcpt, err := agessh.ParseRecipient(k.Raw)
-		if err != nil {
-			fatal("parsing SSH key for age: %v", err)
+	// Per-file mode needs a symmetric secret for filename scrambling.
+	if encryptionMode == tomb.EncryptionPerFile {
+		var ageRecipients []age.Recipient
+		for _, k := range fetchedKeys {
+			rcpt, err := agessh.ParseRecipient(k.Raw)
+			if err != nil {
+				fatal("parsing SSH key for age: %v", err)
+			}
+			ageRecipients = append(ageRecipients, rcpt)
 		}
-		ageRecipients = append(ageRecipients, rcpt)
+
+		if err := tomb.GenerateSecret(gitRoot, ageRecipients); err != nil {
+			fatal("generating secret: %v", err)
+		}
 	}
 
-	if err := tomb.GenerateSecret(gitRoot, ageRecipients); err != nil {
-		fatal("generating secret: %v", err)
+	fmt.Printf("Tomb initialized with %d key(s) for %s (encryption: %s", len(fetchedKeys), displayName, encryptionMode)
+	if encryptionMode == tomb.EncryptionPerFile {
+		fmt.Printf(", scramble: %s", scrambleMode)
 	}
-
-	fmt.Printf("Tomb initialized with %d key(s) for %s (scramble: %s):\n", len(fetchedKeys), displayName, scrambleMode)
+	fmt.Println("):")
 	for _, k := range fetchedKeys {
 		fmt.Printf("  %s %s\n", k.Fingerprint, strings.Fields(k.Raw)[0])
 	}
@@ -450,15 +478,28 @@ func cmdConfig(args []string) {
 	switch len(args) {
 	case 0:
 		// Show all config.
-		scramble := cfg.Scramble
-		if scramble == "" {
-			scramble = tomb.ScrambleFull
+		encryption := cfg.Encryption
+		if encryption == "" {
+			encryption = tomb.EncryptionBundle
 		}
-		fmt.Printf("scramble = %s\n", scramble)
+		fmt.Printf("encryption = %s\n", encryption)
+		if encryption == tomb.EncryptionPerFile {
+			scramble := cfg.Scramble
+			if scramble == "" {
+				scramble = tomb.ScrambleFull
+			}
+			fmt.Printf("scramble   = %s\n", scramble)
+		}
 
 	case 1:
 		// Get a specific key.
 		switch args[0] {
+		case "encryption":
+			encryption := cfg.Encryption
+			if encryption == "" {
+				encryption = tomb.EncryptionBundle
+			}
+			fmt.Println(encryption)
 		case "scramble":
 			scramble := cfg.Scramble
 			if scramble == "" {
@@ -466,13 +507,18 @@ func cmdConfig(args []string) {
 			}
 			fmt.Println(scramble)
 		default:
-			fatal("unknown config key: %s\nAvailable keys: scramble", args[0])
+			fatal("unknown config key: %s\nAvailable keys: encryption, scramble", args[0])
 		}
 
 	case 2:
 		// Set a key.
 		switch args[0] {
+		case "encryption":
+			fatal("encryption mode cannot be changed after init — create a new tomb instead")
 		case "scramble":
+			if cfg.Encryption == tomb.EncryptionBundle {
+				fatal("scramble mode is only available with per-file encryption")
+			}
 			val := tomb.ScrambleMode(args[1])
 			switch val {
 			case tomb.ScrambleFull, tomb.ScrambleKeepExtensions, tomb.ScrambleKeepFilenames:
@@ -481,7 +527,7 @@ func cmdConfig(args []string) {
 				fatal("unknown scramble mode: %s\nAvailable: full, keep-extensions, keep-filenames", args[1])
 			}
 		default:
-			fatal("unknown config key: %s\nAvailable keys: scramble", args[0])
+			fatal("unknown config key: %s\nAvailable keys: encryption, scramble", args[0])
 		}
 
 		if err := tomb.SaveConfig(root, cfg); err != nil {

@@ -125,35 +125,36 @@ func (h *helper) capabilities() error {
 }
 
 // list reports the refs available on the remote.
-// Since the remote is a normal git repo, we can ls-remote it directly,
-// then unscramble the ref names for the local side.
 func (h *helper) list(forPush string) error {
-	// Get the remote refs via ls-remote.
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundleList(forPush)
+	}
+	return h.perFileList(forPush)
+}
+
+// perFileList reports refs for per-file mode by ls-remote + unscrambling.
+func (h *helper) perFileList(forPush string) error {
 	cmd := exec.Command("git", "ls-remote", h.url)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
-		// Probably empty remote.
 		fmt.Fprintf(os.Stderr, "tomb: list refs: %v\n", err)
 		fmt.Println()
 		return nil
 	}
 
-	// Try to load secret + config for ref unscrambling.
 	root, cfg, secret, err := h.loadTombState()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tomb: warning: could not load tomb config: %v\n", err)
-		// Fall back to showing raw refs.
 		fmt.Print(string(out))
 		fmt.Println()
 		return nil
 	}
 	_ = root
 
-	// Build reverse ref map: scrambled → original.
 	refMap := h.buildRefMap(cfg, secret)
 
-	// Parse and unscramble refs.
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -165,7 +166,6 @@ func (h *helper) list(forPush string) error {
 		sha := parts[0]
 		ref := parts[1]
 
-		// Unscramble the ref name.
 		if orig, ok := refMap[ref]; ok {
 			ref = orig
 		}
@@ -178,8 +178,42 @@ func (h *helper) list(forPush string) error {
 	return nil
 }
 
-// fetch decrypts commits from the remote and injects plaintext objects locally.
+// encryptionMode reads the config to determine bundle vs per-file mode.
+func (h *helper) encryptionMode() tomb.EncryptionMode {
+	root, err := tomb.FindRoot(h.repoDir())
+	if err != nil {
+		return tomb.EncryptionBundle // safe fallback for legacy repos
+	}
+	cfg, err := tomb.LoadConfig(root)
+	if err != nil {
+		return tomb.EncryptionBundle
+	}
+	if cfg.Encryption == "" {
+		return tomb.EncryptionBundle
+	}
+	return cfg.Encryption
+}
+
+// fetch dispatches to the appropriate fetch implementation.
 func (h *helper) fetch(refs []string) error {
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundleFetch(refs)
+	}
+	return h.perFileFetch(refs)
+}
+
+// push dispatches to the appropriate push implementation.
+func (h *helper) push(specs []string) error {
+	mode := h.encryptionMode()
+	if mode == tomb.EncryptionBundle {
+		return h.bundlePush(specs)
+	}
+	return h.perFilePush(specs)
+}
+
+// perFileFetch decrypts commits from the remote and injects plaintext objects locally.
+func (h *helper) perFileFetch(refs []string) error {
 	identities, err := h.identities()
 	if err != nil {
 		return fmt.Errorf("loading SSH keys: %w", err)
@@ -268,8 +302,8 @@ func (h *helper) fetch(refs []string) error {
 	return nil
 }
 
-// push encrypts local commits and pushes them to the remote.
-func (h *helper) push(specs []string) error {
+// perFilePush encrypts local commits and pushes them to the remote.
+func (h *helper) perFilePush(specs []string) error {
 	root, cfg, secret, err := h.loadTombState()
 	if err != nil {
 		return fmt.Errorf("loading tomb state: %w", err)

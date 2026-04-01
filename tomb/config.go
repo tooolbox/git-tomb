@@ -47,10 +47,27 @@ const (
 	ScrambleKeepFilenames ScrambleMode = "keep-filenames"
 )
 
+// EncryptionMode controls how the repo is encrypted on the remote.
+type EncryptionMode string
+
+const (
+	// EncryptionBundle encrypts the entire repo as a single age-encrypted
+	// git bundle. The remote sees only two opaque files. Maximum privacy
+	// (hides file count, structure, branch names) but requires full
+	// re-upload on every push.
+	EncryptionBundle EncryptionMode = "bundle"
+
+	// EncryptionPerFile encrypts each file individually with scrambled
+	// filenames. The remote is a normal git repo that works without tomb.
+	// Enables incremental push/pull but leaks file count and tree shape.
+	EncryptionPerFile EncryptionMode = "per-file"
+)
+
 // Config is the tomb configuration for a repository.
 type Config struct {
-	Recipients []Recipient  `json:"recipients"`
-	Scramble   ScrambleMode `json:"scramble,omitempty"`
+	Recipients []Recipient    `json:"recipients"`
+	Encryption EncryptionMode `json:"encryption,omitempty"`
+	Scramble   ScrambleMode   `json:"scramble,omitempty"`
 }
 
 // FindRoot walks up from dir looking for a .tomb directory.
