@@ -214,19 +214,9 @@ func (h *helper) push(specs []string) error {
 
 // perFileFetch decrypts commits from the remote and injects plaintext objects locally.
 func (h *helper) perFileFetch(refs []string) error {
-	identities, err := h.identities()
-	if err != nil {
-		return fmt.Errorf("loading SSH keys: %w", err)
-	}
-
 	root, cfg, secret, err := h.loadTombState()
 	if err != nil {
 		return fmt.Errorf("loading tomb state: %w", err)
-	}
-
-	recipients, err := recipientsFromConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("parsing recipients: %w", err)
 	}
 
 	// Fetch the encrypted objects from the remote into a temp bare repo.
@@ -256,14 +246,9 @@ func (h *helper) perFileFetch(refs []string) error {
 		mode = crypt.ScrambleFull
 	}
 
-	rw := &rewriter{
-		secret:      secret,
-		recipients:  recipients,
-		identities:  identities,
-		mode:        mode,
-		cm:          cm,
-		workDir:     tmpDir,
-		localGitDir: absGitDir,
+	rw, err := newRewriter(secret, mode, cm, tmpDir, absGitDir)
+	if err != nil {
+		return fmt.Errorf("creating rewriter: %w", err)
 	}
 
 	// For each ref the user wants to fetch, translate the commit chain.
@@ -313,16 +298,6 @@ func (h *helper) perFilePush(specs []string) error {
 		return fmt.Errorf("no recipients configured — run 'git tomb add <provider> <username>' first")
 	}
 
-	recipients, err := recipientsFromConfig(cfg)
-	if err != nil {
-		return err
-	}
-
-	identities, err := h.identities()
-	if err != nil {
-		return fmt.Errorf("loading SSH keys: %w", err)
-	}
-
 	cm, err := loadCommitMap(root)
 	if err != nil {
 		return fmt.Errorf("loading commit map: %w", err)
@@ -345,14 +320,9 @@ func (h *helper) perFilePush(specs []string) error {
 		mode = crypt.ScrambleFull
 	}
 
-	rw := &rewriter{
-		secret:      secret,
-		recipients:  recipients,
-		identities:  identities,
-		mode:        mode,
-		cm:          cm,
-		workDir:     tmpDir,
-		localGitDir: absGitDir,
+	rw, err := newRewriter(secret, mode, cm, tmpDir, absGitDir)
+	if err != nil {
+		return fmt.Errorf("creating rewriter: %w", err)
 	}
 
 	// Fetch existing remote objects so we can do incremental push.

@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-
-	"filippo.io/age"
 )
 
 // ManifestFile is the name of the encrypted manifest stored in each commit tree.
@@ -16,24 +13,34 @@ const ManifestFile = ".tomb-manifest.age"
 // Key: scrambled path, Value: original path.
 type Manifest map[string]string
 
-// EncryptManifest serializes and encrypts the manifest for the given recipients.
-func EncryptManifest(m Manifest, recipients []age.Recipient) ([]byte, error) {
+// EncryptManifest serializes and encrypts the manifest using the shared secret.
+func EncryptManifest(m Manifest, secret []byte) ([]byte, error) {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling manifest: %w", err)
 	}
 
+	key, err := ManifestKey(secret)
+	if err != nil {
+		return nil, err
+	}
+
 	var buf bytes.Buffer
-	if err := Encrypt(&buf, bytes.NewReader(data), recipients); err != nil {
+	if err := SymmetricEncrypt(&buf, bytes.NewReader(data), key); err != nil {
 		return nil, fmt.Errorf("encrypting manifest: %w", err)
 	}
 	return buf.Bytes(), nil
 }
 
-// DecryptManifest decrypts and deserializes a manifest.
-func DecryptManifest(encData []byte, identities []age.Identity) (Manifest, error) {
+// DecryptManifest decrypts and deserializes a manifest using the shared secret.
+func DecryptManifest(encData []byte, secret []byte) (Manifest, error) {
+	key, err := ManifestKey(secret)
+	if err != nil {
+		return nil, err
+	}
+
 	var buf bytes.Buffer
-	if err := Decrypt(&buf, bytes.NewReader(encData), identities); err != nil {
+	if err := SymmetricDecrypt(&buf, bytes.NewReader(encData), key); err != nil {
 		return nil, fmt.Errorf("decrypting manifest: %w", err)
 	}
 
@@ -61,23 +68,4 @@ func (m Manifest) Inverted() map[string]string {
 		inv[original] = scrambled
 	}
 	return inv
-}
-
-// EncryptMessage encrypts a commit message with age.
-func EncryptMessage(msg string, recipients []age.Recipient) (string, error) {
-	var buf bytes.Buffer
-	if err := Encrypt(&buf, bytes.NewReader([]byte(msg)), recipients); err != nil {
-		return "", err
-	}
-	// Encode as raw bytes — we'll base64 it at the call site or store as binary blob.
-	return buf.String(), nil
-}
-
-// DecryptMessage decrypts a commit message.
-func DecryptMessage(encrypted string, identities []age.Identity) (string, error) {
-	var buf bytes.Buffer
-	if err := Decrypt(&buf, io.NopCloser(bytes.NewReader([]byte(encrypted))), identities); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
 }

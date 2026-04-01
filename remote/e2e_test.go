@@ -113,14 +113,9 @@ func TestE2E_PushAndClone(t *testing.T) {
 	must(t, os.MkdirAll(pushWorkDir, 0o700))
 	git(t, "", "init", "--bare", "--quiet", pushWorkDir)
 
-	rw := &rewriter{
-		secret:      secret,
-		recipients:  []age.Recipient{recipient},
-		identities:  []age.Identity{identity},
-		mode:        crypt.ScrambleFull,
-		cm:          cm,
-		workDir:     pushWorkDir,
-		localGitDir: localGitDir,
+	rw, err := newRewriter(secret, crypt.ScrambleFull, cm, pushWorkDir, localGitDir)
+	if err != nil {
+		t.Fatalf("newRewriter: %v", err)
 	}
 
 	// Get the local HEAD SHA.
@@ -162,14 +157,9 @@ func TestE2E_PushAndClone(t *testing.T) {
 	git(t, fetchWorkDir, "fetch", "--quiet", remoteDir, "+refs/*:refs/*")
 
 	cm2 := newCommitMap()
-	rw2 := &rewriter{
-		secret:      secret,
-		recipients:  []age.Recipient{recipient},
-		identities:  []age.Identity{identity},
-		mode:        crypt.ScrambleFull,
-		cm:          cm2,
-		workDir:     fetchWorkDir,
-		localGitDir: cloneGitDir,
+	rw2, err := newRewriter(secret, crypt.ScrambleFull, cm2, fetchWorkDir, cloneGitDir)
+	if err != nil {
+		t.Fatalf("newRewriter: %v", err)
 	}
 
 	// Decrypt the commit chain.
@@ -264,10 +254,9 @@ func TestE2E_ScrambleModes(t *testing.T) {
 			must(t, os.MkdirAll(workDir, 0o700))
 			git(t, "", "init", "--bare", "--quiet", workDir)
 
-			rw := &rewriter{
-				secret: secret, recipients: []age.Recipient{recipient},
-				identities: []age.Identity{identity}, mode: tt.mode,
-				cm: newCommitMap(), workDir: workDir, localGitDir: localGitDir,
+			rw, err := newRewriter(secret, tt.mode, newCommitMap(), workDir, localGitDir)
+			if err != nil {
+				t.Fatalf("newRewriter: %v", err)
 			}
 
 			headSHA := strings.TrimSpace(gitOutput(t, localDir, "rev-parse", "HEAD"))

@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"filippo.io/age"
-
 	"github.com/tooolbox/git-tomb/crypt"
 )
 
@@ -69,16 +67,37 @@ func saveCommitMap(tombRoot string, cm *commitMap) error {
 
 // rewriter translates commits between plaintext (local) and encrypted (remote) forms.
 type rewriter struct {
-	secret     []byte
-	recipients []age.Recipient
-	identities []age.Identity
-	mode       crypt.ScrambleMode
-	cm         *commitMap
+	secret  []byte
+	blobKey []byte // derived subkey for blob encryption
+	msgKey  []byte // derived subkey for commit message encryption
+	mode    crypt.ScrambleMode
+	cm      *commitMap
 
 	// workDir is a bare repo used for staging remote objects.
 	workDir string
 	// localGitDir is the path to the local repo's .git directory.
 	localGitDir string
+}
+
+// newRewriter creates a rewriter with derived subkeys.
+func newRewriter(secret []byte, mode crypt.ScrambleMode, cm *commitMap, workDir, localGitDir string) (*rewriter, error) {
+	blobKey, err := crypt.BlobKey(secret)
+	if err != nil {
+		return nil, fmt.Errorf("deriving blob key: %w", err)
+	}
+	msgKey, err := crypt.MessageKey(secret)
+	if err != nil {
+		return nil, fmt.Errorf("deriving message key: %w", err)
+	}
+	return &rewriter{
+		secret:      secret,
+		blobKey:     blobKey,
+		msgKey:      msgKey,
+		mode:        mode,
+		cm:          cm,
+		workDir:     workDir,
+		localGitDir: localGitDir,
+	}, nil
 }
 
 // treeEntry represents one entry in a git tree object.
@@ -139,7 +158,7 @@ func (rw *rewriter) encryptCommit(localSHA string) (string, error) {
 	}
 
 	// Add manifest to the tree.
-	manifestData, err := crypt.EncryptManifest(manifest, rw.recipients)
+	manifestData, err := crypt.EncryptManifest(manifest, rw.secret)
 	if err != nil {
 		return "", fmt.Errorf("encrypting manifest: %w", err)
 	}
@@ -208,7 +227,7 @@ func (rw *rewriter) decryptCommit(remoteSHA string) (string, error) {
 		return "", fmt.Errorf("reading manifest blob: %w", err)
 	}
 
-	manifest, err := crypt.DecryptManifest(manifestData, rw.identities)
+	manifest, err := crypt.DecryptManifest(manifestData, rw.secret)
 	if err != nil {
 		return "", fmt.Errorf("decrypting manifest: %w", err)
 	}
@@ -275,7 +294,7 @@ func (rw *rewriter) encryptTree(entries []treeEntry, invertedManifest map[string
 			}
 
 			var encBuf bytes.Buffer
-			if err := crypt.Encrypt(&encBuf, bytes.NewReader(plainData), rw.recipients); err != nil {
+			if err := crypt.SymmetricEncrypt(&encBuf, bytes.NewReader(plainData), rw.blobKey); err != nil {
 				return "", fmt.Errorf("encrypting %s: %w", fullPath, err)
 			}
 
@@ -334,7 +353,7 @@ func (rw *rewriter) decryptTree(entries []treeEntry, manifest crypt.Manifest, pr
 			}
 
 			var decBuf bytes.Buffer
-			if err := crypt.Decrypt(&decBuf, bytes.NewReader(encData), rw.identities); err != nil {
+			if err := crypt.SymmetricDecrypt(&decBuf, bytes.NewReader(encData), rw.blobKey); err != nil {
 				return "", fmt.Errorf("decrypting %s: %w", scrambledPath, err)
 			}
 
@@ -414,7 +433,7 @@ func (rw *rewriter) findOriginalFileName(scrambledPath string, manifest crypt.Ma
 // encryptMessage encrypts a commit message and wraps it with the tomb prefix.
 func (rw *rewriter) encryptMessage(msg string) (string, error) {
 	var buf bytes.Buffer
-	if err := crypt.Encrypt(&buf, bytes.NewReader([]byte(msg)), rw.recipients); err != nil {
+	if err := crypt.SymmetricEncrypt(&buf, bytes.NewReader([]byte(msg)), rw.msgKey); err != nil {
 		return "", err
 	}
 	encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
@@ -428,7 +447,7 @@ func (rw *rewriter) decryptMessage(payload string) (string, error) {
 		return "", fmt.Errorf("base64 decode: %w", err)
 	}
 	var buf bytes.Buffer
-	if err := crypt.Decrypt(&buf, bytes.NewReader(data), rw.identities); err != nil {
+	if err := crypt.SymmetricDecrypt(&buf, bytes.NewReader(data), rw.msgKey); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
