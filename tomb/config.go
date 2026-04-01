@@ -30,9 +30,27 @@ type PinnedKey struct {
 	Fingerprint string `json:"fingerprint"`
 }
 
+// ScrambleMode controls how filenames are scrambled on the remote.
+type ScrambleMode string
+
+const (
+	// ScrambleFull scrambles both directory and file names.
+	// "src/main.go" → "apple-banana/cedar-drift.tomb"
+	ScrambleFull ScrambleMode = "full"
+
+	// ScrambleKeepExtensions scrambles names but preserves file extensions.
+	// "src/main.go" → "apple-banana/cedar-drift.go"
+	ScrambleKeepExtensions ScrambleMode = "keep-extensions"
+
+	// ScrambleKeepFilenames keeps original filenames, only scrambles directories.
+	// "src/main.go" → "apple-banana/main.go"
+	ScrambleKeepFilenames ScrambleMode = "keep-filenames"
+)
+
 // Config is the tomb configuration for a repository.
 type Config struct {
-	Recipients []Recipient `json:"recipients"`
+	Recipients []Recipient  `json:"recipients"`
+	Scramble   ScrambleMode `json:"scramble,omitempty"`
 }
 
 // FindRoot walks up from dir looking for a .tomb directory.

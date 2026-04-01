@@ -12,8 +12,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
+
+	"filippo.io/age"
+	"filippo.io/age/agessh"
 
 	"github.com/tooolbox/git-tomb/keys"
 	_ "github.com/tooolbox/git-tomb/keys" // Register providers.
@@ -37,6 +41,8 @@ func main() {
 		cmdList()
 	case "refresh":
 		cmdRefresh()
+	case "config":
+		cmdConfig(os.Args[2:])
 	case "version", "--version", "-v":
 		cmdVersion()
 	case "help", "--help", "-h":
@@ -52,18 +58,24 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: git tomb <command> [args]
 
 Commands:
-  init [provider] [username]  Initialize a tomb (adds your keys)
-  add <provider> <username>   Add a recipient (fetches their SSH keys)
-  remove <username>           Remove a recipient
-  list                        List all recipients
-  refresh                     Re-fetch keys for all recipients
+  init [options] [provider] [username]  Initialize a tomb (adds your keys)
+  add <provider> <username>             Add a recipient (fetches their SSH keys)
+  remove <username>                     Remove a recipient
+  list                                  List all recipients
+  refresh                               Re-fetch keys for all recipients
+  config [key] [value]                  View or set configuration
 
 Providers: github, gitlab, file
 
+Init options:
+  --scramble=full             Scramble filenames and extensions (default)
+  --scramble=keep-extensions  Scramble filenames, keep extensions (.go, .js, etc.)
+  --scramble=keep-filenames   Scramble directories only, keep original filenames
+
 Init examples:
-  git tomb init                             # auto-discover local ~/.ssh/ keys
-  git tomb init github mmccullough          # use GitHub SSH keys
-  git tomb init file ~/.ssh/id_ed25519.pub  # use a specific key file
+  git tomb init                                           # auto-discover local keys
+  git tomb init github mmccullough                        # use GitHub SSH keys
+  git tomb init --scramble=keep-extensions github alice    # keep extensions visible
 
 Workflow:
   git tomb init github mmccullough
@@ -87,6 +99,24 @@ func cmdInit(args []string) {
 	if _, err := tomb.FindRoot(gitRoot); err == nil {
 		fatal("tomb is already initialized in this repository")
 	}
+
+	// Parse --scramble flag from args.
+	scrambleMode := tomb.ScrambleFull
+	var remaining []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--scramble=") {
+			val := strings.TrimPrefix(a, "--scramble=")
+			switch tomb.ScrambleMode(val) {
+			case tomb.ScrambleFull, tomb.ScrambleKeepExtensions, tomb.ScrambleKeepFilenames:
+				scrambleMode = tomb.ScrambleMode(val)
+			default:
+				fatal("unknown scramble mode: %s (use full, keep-extensions, or keep-filenames)", val)
+			}
+		} else {
+			remaining = append(remaining, a)
+		}
+	}
+	args = remaining
 
 	// Determine how to get keys.
 	var provider string
@@ -123,7 +153,7 @@ func cmdInit(args []string) {
 			fatal("failed to fetch keys: %v", err)
 		}
 	default:
-		fatal("usage: git tomb init [provider username]")
+		fatal("usage: git tomb init [--scramble=MODE] [provider username]")
 	}
 
 	if len(fetchedKeys) == 0 {
@@ -152,13 +182,28 @@ func cmdInit(args []string) {
 				Keys:     pinned,
 			},
 		},
+		Scramble: scrambleMode,
 	}
 
 	if err := tomb.SaveConfig(gitRoot, cfg); err != nil {
 		fatal("saving config: %v", err)
 	}
 
-	fmt.Printf("Tomb initialized with %d key(s) for %s:\n", len(fetchedKeys), displayName)
+	// Generate the symmetric secret and encrypt it for the initial recipients.
+	var ageRecipients []age.Recipient
+	for _, k := range fetchedKeys {
+		rcpt, err := agessh.ParseRecipient(k.Raw)
+		if err != nil {
+			fatal("parsing SSH key for age: %v", err)
+		}
+		ageRecipients = append(ageRecipients, rcpt)
+	}
+
+	if err := tomb.GenerateSecret(gitRoot, ageRecipients); err != nil {
+		fatal("generating secret: %v", err)
+	}
+
+	fmt.Printf("Tomb initialized with %d key(s) for %s (scramble: %s):\n", len(fetchedKeys), displayName, scrambleMode)
 	for _, k := range fetchedKeys {
 		fmt.Printf("  %s %s\n", k.Fingerprint, strings.Fields(k.Raw)[0])
 	}
@@ -217,6 +262,24 @@ func cmdAdd(args []string) {
 		fatal("saving config: %v", err)
 	}
 
+	// Re-encrypt the secret for the updated recipient set.
+	if tomb.SecretExists(root) {
+		allRecipients, err := allAgeRecipients(cfg)
+		if err != nil {
+			fatal("parsing recipient keys: %v", err)
+		}
+
+		identities, err := loadLocalIdentities()
+		if err != nil {
+			fatal("loading SSH keys for re-encryption: %v", err)
+		}
+
+		if err := tomb.ReencryptSecret(root, identities, allRecipients); err != nil {
+			fatal("re-encrypting secret: %v", err)
+		}
+		fmt.Println("Secret re-encrypted for updated recipient set.")
+	}
+
 	fmt.Printf("Added %d key(s) for %s (%s):\n", len(fetchedKeys), username, provider)
 	for _, k := range fetchedKeys {
 		fmt.Printf("  %s %s\n", k.Fingerprint, strings.Fields(k.Raw)[0])
@@ -245,6 +308,24 @@ func cmdRemove(args []string) {
 
 	if err := tomb.SaveConfig(root, cfg); err != nil {
 		fatal("saving config: %v", err)
+	}
+
+	// Re-encrypt the secret for the remaining recipients.
+	if tomb.SecretExists(root) && len(cfg.Recipients) > 0 {
+		allRecipients, err := allAgeRecipients(cfg)
+		if err != nil {
+			fatal("parsing recipient keys: %v", err)
+		}
+
+		identities, err := loadLocalIdentities()
+		if err != nil {
+			fatal("loading SSH keys for re-encryption: %v", err)
+		}
+
+		if err := tomb.ReencryptSecret(root, identities, allRecipients); err != nil {
+			fatal("re-encrypting secret: %v", err)
+		}
+		fmt.Println("Secret re-encrypted for updated recipient set.")
 	}
 
 	fmt.Printf("Removed %s\n", username)
@@ -355,6 +436,64 @@ func cmdRefresh() {
 	fmt.Println("Done.")
 }
 
+func cmdConfig(args []string) {
+	root, err := tomb.FindRoot(".")
+	if err != nil {
+		fatal("not a tomb repository — run 'git tomb init' first")
+	}
+
+	cfg, err := tomb.LoadConfig(root)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	switch len(args) {
+	case 0:
+		// Show all config.
+		scramble := cfg.Scramble
+		if scramble == "" {
+			scramble = tomb.ScrambleFull
+		}
+		fmt.Printf("scramble = %s\n", scramble)
+
+	case 1:
+		// Get a specific key.
+		switch args[0] {
+		case "scramble":
+			scramble := cfg.Scramble
+			if scramble == "" {
+				scramble = tomb.ScrambleFull
+			}
+			fmt.Println(scramble)
+		default:
+			fatal("unknown config key: %s\nAvailable keys: scramble", args[0])
+		}
+
+	case 2:
+		// Set a key.
+		switch args[0] {
+		case "scramble":
+			val := tomb.ScrambleMode(args[1])
+			switch val {
+			case tomb.ScrambleFull, tomb.ScrambleKeepExtensions, tomb.ScrambleKeepFilenames:
+				cfg.Scramble = val
+			default:
+				fatal("unknown scramble mode: %s\nAvailable: full, keep-extensions, keep-filenames", args[1])
+			}
+		default:
+			fatal("unknown config key: %s\nAvailable keys: scramble", args[0])
+		}
+
+		if err := tomb.SaveConfig(root, cfg); err != nil {
+			fatal("saving config: %v", err)
+		}
+		fmt.Printf("%s = %s\n", args[0], args[1])
+
+	default:
+		fatal("usage: git tomb config [key] [value]")
+	}
+}
+
 func cmdVersion() {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -406,6 +545,57 @@ func gitRepoRoot() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// allAgeRecipients converts all SSH keys in the config to age recipients.
+func allAgeRecipients(cfg *tomb.Config) ([]age.Recipient, error) {
+	var recipients []age.Recipient
+	for _, r := range cfg.Recipients {
+		for _, k := range r.Keys {
+			rcpt, err := agessh.ParseRecipient(k.Raw)
+			if err != nil {
+				return nil, fmt.Errorf("parsing key for %s/%s: %w", r.Provider, r.Username, err)
+			}
+			recipients = append(recipients, rcpt)
+		}
+	}
+	return recipients, nil
+}
+
+// loadLocalIdentities loads the user's SSH private keys for decryption.
+// This is a simplified version for CLI commands (not the remote helper).
+func loadLocalIdentities() ([]age.Identity, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	// Also check HOME env var (git-bash on Windows).
+	sshDir := filepath.Join(home, ".ssh")
+	if h := os.Getenv("HOME"); h != "" {
+		candidate := filepath.Join(h, ".ssh")
+		if info, statErr := os.Stat(candidate); statErr == nil && info.IsDir() {
+			sshDir = candidate
+		}
+	}
+
+	var identities []age.Identity
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		pemData, err := os.ReadFile(filepath.Join(sshDir, name))
+		if err != nil {
+			continue
+		}
+		id, err := agessh.ParseIdentity(pemData)
+		if err != nil {
+			continue
+		}
+		identities = append(identities, id)
+	}
+
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("no SSH keys found in %s", sshDir)
+	}
+	return identities, nil
 }
 
 func fatal(format string, args ...interface{}) {
