@@ -63,25 +63,11 @@ func TestE2E_PushAndClone(t *testing.T) {
 	// 2. Create bare remote repo.
 	git(t, "", "init", "--bare", "--quiet", remoteDir)
 
-	// 3. Create local repo with some files.
+	// 3. Create local repo and initialize tomb FIRST so .tomb/ is committed.
 	git(t, "", "init", "--quiet", localDir)
 	git(t, localDir, "config", "user.email", "test@test.com")
 	git(t, localDir, "config", "user.name", "Test User")
 
-	writeFile(t, localDir, "README.md", "# Hello World\n\nThis is a test repo.\n")
-	writeFile(t, localDir, "src/main.go", "package main\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n")
-	writeFile(t, localDir, "src/util.go", "package main\n\nfunc add(a, b int) int { return a + b }\n")
-	writeFile(t, localDir, "docs/guide.txt", "This is the user guide.\n")
-
-	git(t, localDir, "add", "-A")
-	git(t, localDir, "commit", "--quiet", "-m", "Initial commit with some files")
-
-	// Add a second commit to test incremental handling.
-	writeFile(t, localDir, "CHANGELOG.md", "## v0.1.0\n- Initial release\n")
-	git(t, localDir, "add", "-A")
-	git(t, localDir, "commit", "--quiet", "-m", "Add changelog")
-
-	// 4. Initialize tomb in the local repo.
 	tombRoot := localDir
 	cfg := &tomb.Config{
 		Recipients: []tomb.Recipient{
@@ -103,6 +89,20 @@ func TestE2E_PushAndClone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loading secret: %v", err)
 	}
+
+	// Now add files and commit (including .tomb/).
+	writeFile(t, localDir, "README.md", "# Hello World\n\nThis is a test repo.\n")
+	writeFile(t, localDir, "src/main.go", "package main\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n")
+	writeFile(t, localDir, "src/util.go", "package main\n\nfunc add(a, b int) int { return a + b }\n")
+	writeFile(t, localDir, "docs/guide.txt", "This is the user guide.\n")
+
+	git(t, localDir, "add", "-A")
+	git(t, localDir, "commit", "--quiet", "-m", "Initial commit with some files")
+
+	// Add a second commit to test incremental handling.
+	writeFile(t, localDir, "CHANGELOG.md", "## v0.1.0\n- Initial release\n")
+	git(t, localDir, "add", "-A")
+	git(t, localDir, "commit", "--quiet", "-m", "Add changelog")
 
 	// 5. Push using the rewrite engine.
 	localGitDir := filepath.Join(localDir, ".git")
@@ -137,18 +137,13 @@ func TestE2E_PushAndClone(t *testing.T) {
 	verifyRemoteScrambled(t, remoteDir, secret)
 
 	// 7. Fetch into a fresh clone repo and verify plaintext.
+	// The clone has NO .tomb/ initially — decryptCommit must include it
+	// from the remote tree so the collaborator can access the secret.
 	t.Log("--- Fetching into fresh clone ---")
 	cloneGitDir := filepath.Join(cloneDir, ".git")
 	git(t, "", "init", "--quiet", cloneDir)
 	git(t, cloneDir, "config", "user.email", "test@test.com")
 	git(t, cloneDir, "config", "user.name", "Test User")
-
-	// Set up tomb in the clone.
-	must(t, tomb.SaveConfig(cloneDir, cfg))
-	must(t, tomb.GenerateSecret(cloneDir, []age.Recipient{recipient}))
-	// Overwrite with the same secret.
-	secretData, _ := os.ReadFile(tomb.SecretPath(tombRoot))
-	must(t, os.WriteFile(tomb.SecretPath(cloneDir), secretData, 0o644))
 
 	// Create a temp bare repo to fetch remote objects into.
 	fetchWorkDir := filepath.Join(tmp, "fetch-work")
@@ -156,6 +151,9 @@ func TestE2E_PushAndClone(t *testing.T) {
 	git(t, "", "init", "--bare", "--quiet", fetchWorkDir)
 	git(t, fetchWorkDir, "fetch", "--quiet", remoteDir, "+refs/*:refs/*")
 
+	// The clone needs the secret to decrypt. In real usage, the helper
+	// extracts .tomb/ from the remote. Here we simulate by using the
+	// same secret (the collaborator can decrypt secret.age with their key).
 	cm2 := newCommitMap()
 	rw2, err := newRewriter(secret, crypt.ScrambleFull, cm2, fetchWorkDir, cloneGitDir)
 	if err != nil {
@@ -234,11 +232,7 @@ func TestE2E_ScrambleModes(t *testing.T) {
 			git(t, localDir, "config", "user.email", "test@test.com")
 			git(t, localDir, "config", "user.name", "Test User")
 
-			writeFile(t, localDir, "src/main.go", "package main\n")
-			writeFile(t, localDir, "docs/README.md", "# Docs\n")
-			git(t, localDir, "add", "-A")
-			git(t, localDir, "commit", "--quiet", "-m", "init")
-
+			// Init tomb BEFORE commits so .tomb/ is in the tree.
 			cfg := &tomb.Config{
 				Recipients: []tomb.Recipient{
 					{Provider: "file", Username: "test", Keys: []tomb.PinnedKey{{Raw: pubKeyStr, Fingerprint: "fp"}}},
@@ -248,6 +242,11 @@ func TestE2E_ScrambleModes(t *testing.T) {
 			must(t, tomb.SaveConfig(localDir, cfg))
 			must(t, tomb.GenerateSecret(localDir, []age.Recipient{recipient}))
 			secret, _ := tomb.LoadSecret(localDir, []age.Identity{identity})
+
+			writeFile(t, localDir, "src/main.go", "package main\n")
+			writeFile(t, localDir, "docs/README.md", "# Docs\n")
+			git(t, localDir, "add", "-A")
+			git(t, localDir, "commit", "--quiet", "-m", "init")
 
 			localGitDir := filepath.Join(localDir, ".git")
 			workDir := filepath.Join(tmp, "work")
@@ -274,10 +273,15 @@ func TestE2E_ScrambleModes(t *testing.T) {
 
 			lines := strings.Split(strings.TrimSpace(files), "\n")
 
+			// Helper to skip non-content entries.
+			isPassthrough := func(f string) bool {
+				return f == crypt.ManifestFile || strings.HasPrefix(f, ".tomb/") || f == ".tomb"
+			}
+
 			switch tt.mode {
 			case crypt.ScrambleFull:
 				for _, f := range lines {
-					if f == crypt.ManifestFile {
+					if isPassthrough(f) {
 						continue
 					}
 					if !strings.HasSuffix(f, ".tomb") {
@@ -291,7 +295,7 @@ func TestE2E_ScrambleModes(t *testing.T) {
 
 			case crypt.ScrambleKeepExtensions:
 				for _, f := range lines {
-					if f == crypt.ManifestFile {
+					if isPassthrough(f) {
 						continue
 					}
 					// Should have original extensions.
@@ -310,7 +314,7 @@ func TestE2E_ScrambleModes(t *testing.T) {
 				foundMain := false
 				foundReadme := false
 				for _, f := range lines {
-					if f == crypt.ManifestFile {
+					if isPassthrough(f) {
 						continue
 					}
 					base := filepath.Base(f)
@@ -438,9 +442,9 @@ func verifyRemoteScrambled(t *testing.T, remoteDir string, secret []byte) {
 		t.Error("manifest file not found in remote tree")
 	}
 
-	// No original filenames should appear.
+	// No original filenames should appear (except in .tomb/ which is passthrough).
 	for _, f := range lines {
-		if f == crypt.ManifestFile {
+		if f == crypt.ManifestFile || strings.HasPrefix(f, ".tomb/") || f == ".tomb" {
 			continue
 		}
 		for _, orig := range []string{"README", "main.go", "util.go", "guide.txt", "CHANGELOG", "src", "docs"} {

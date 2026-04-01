@@ -214,12 +214,9 @@ func (h *helper) push(specs []string) error {
 
 // perFileFetch decrypts commits from the remote and injects plaintext objects locally.
 func (h *helper) perFileFetch(refs []string) error {
-	root, cfg, secret, err := h.loadTombState()
-	if err != nil {
-		return fmt.Errorf("loading tomb state: %w", err)
-	}
-
-	// Fetch the encrypted objects from the remote into a temp bare repo.
+	// Fetch the encrypted objects from the remote into a temp bare repo first,
+	// because on a fresh clone we may need to extract .tomb/ from the remote
+	// before we can load the secret.
 	tmpDir, err := os.MkdirTemp("", "tomb-fetch-*")
 	if err != nil {
 		return err
@@ -230,9 +227,24 @@ func (h *helper) perFileFetch(refs []string) error {
 		return fmt.Errorf("init temp repo: %w", err)
 	}
 
-	// Fetch all refs from the remote.
 	if err := run(tmpDir, "git", "fetch", "--quiet", h.url, "+refs/*:refs/*"); err != nil {
 		return fmt.Errorf("fetching remote: %w", err)
+	}
+
+	// Try to load tomb state from the local repo.
+	root, cfg, secret, err := h.loadTombState()
+	if err != nil {
+		// On a fresh clone, .tomb/ doesn't exist locally yet.
+		// Extract it from the remote's latest commit.
+		fmt.Fprintf(os.Stderr, "tomb: local .tomb/ not found, extracting from remote...\n")
+		if extractErr := h.extractTombFromRemote(tmpDir); extractErr != nil {
+			return fmt.Errorf("could not load tomb state locally or from remote: local: %v, remote: %v", err, extractErr)
+		}
+		// Retry loading state.
+		root, cfg, secret, err = h.loadTombState()
+		if err != nil {
+			return fmt.Errorf("loading tomb state after extraction: %w", err)
+		}
 	}
 
 	cm, err := loadCommitMap(root)
@@ -405,6 +417,60 @@ func (h *helper) loadTombState() (root string, cfg *tomb.Config, secret []byte, 
 
 	secret, err = tomb.LoadSecret(root, identities)
 	return
+}
+
+// extractTombFromRemote finds .tomb/ in the remote's latest commit and
+// writes it to the local working tree. This is needed on a fresh clone
+// where the local repo has no .tomb/ yet.
+func (h *helper) extractTombFromRemote(tmpDir string) error {
+	// Find any ref in the temp repo to get a commit with a .tomb/ entry.
+	cmd := exec.Command("git", "for-each-ref", "--format=%(objectname)", "--count=1", "refs/")
+	cmd.Dir = tmpDir
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("no refs found in remote")
+	}
+	commitSHA := strings.TrimSpace(string(out))
+
+	// Get the tree SHA from the commit.
+	cmd = exec.Command("git", "rev-parse", commitSHA+"^{tree}")
+	cmd.Dir = tmpDir
+	out, err = cmd.Output()
+	if err != nil {
+		return fmt.Errorf("getting tree from commit: %w", err)
+	}
+	treeSHA := strings.TrimSpace(string(out))
+
+	// Look for .tomb/ in the tree.
+	cmd = exec.Command("git", "ls-tree", treeSHA, ".tomb/")
+	cmd.Dir = tmpDir
+	out, err = cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf(".tomb/ not found in remote tree")
+	}
+
+	// Use git archive to extract .tomb/ into the local working tree.
+	repoDir := h.repoDir()
+	cmd = exec.Command("git", "archive", "--format=tar", commitSHA, ".tomb/")
+	cmd.Dir = tmpDir
+
+	tar := exec.Command("tar", "xf", "-")
+	tar.Dir = repoDir
+	tar.Stdin, _ = cmd.StdoutPipe()
+	tar.Stderr = os.Stderr
+
+	if err := tar.Start(); err != nil {
+		return fmt.Errorf("starting tar: %w", err)
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git archive: %w", err)
+	}
+	if err := tar.Wait(); err != nil {
+		return fmt.Errorf("tar extract: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "tomb: extracted .tomb/ from remote\n")
+	return nil
 }
 
 // buildRefMap builds a scrambled→original ref mapping for all known local refs.

@@ -263,6 +263,11 @@ func (rw *rewriter) decryptCommit(remoteSHA string) (string, error) {
 	return localSHA, nil
 }
 
+// tombDir is the name of the .tomb configuration directory.
+// It is passed through unencrypted so collaborators can access
+// recipients.json and secret.age on clone.
+const tombDir = ".tomb"
+
 // encryptTree recursively builds an encrypted tree in the work repo.
 func (rw *rewriter) encryptTree(entries []treeEntry, invertedManifest map[string]string, prefix string) (string, error) {
 	var newEntries []treeEntry
@@ -271,6 +276,19 @@ func (rw *rewriter) encryptTree(entries []treeEntry, invertedManifest map[string
 		fullPath := e.path
 		if prefix != "" {
 			fullPath = prefix + "/" + e.path
+		}
+
+		// Pass .tomb/ through unencrypted at the top level.
+		// It contains recipients.json (public keys) and secret.age
+		// (already age-encrypted), so it's safe to store in plaintext.
+		if prefix == "" && e.path == tombDir && e.isTree() {
+			// Copy the entire .tomb subtree as-is, but skip commit-map.json.
+			tombTreeSHA, err := rw.copyTreeFiltered(rw.localGitDir, rw.workDir, e.sha)
+			if err != nil {
+				return "", fmt.Errorf("copying .tomb: %w", err)
+			}
+			newEntries = append(newEntries, treeEntry{mode: e.mode, path: tombDir, sha: tombTreeSHA})
+			continue
 		}
 
 		if e.isTree() {
@@ -319,6 +337,16 @@ func (rw *rewriter) decryptTree(entries []treeEntry, manifest crypt.Manifest, pr
 	for _, e := range entries {
 		// Skip the manifest file.
 		if prefix == "" && e.path == crypt.ManifestFile {
+			continue
+		}
+
+		// Pass .tomb/ through unencrypted — copy as-is.
+		if prefix == "" && e.path == tombDir && e.isTree() {
+			tombTreeSHA, err := rw.copyTreeFiltered(rw.workDir, rw.localGitDir, e.sha)
+			if err != nil {
+				return "", fmt.Errorf("copying .tomb: %w", err)
+			}
+			newEntries = append(newEntries, treeEntry{mode: e.mode, path: tombDir, sha: tombTreeSHA})
 			continue
 		}
 
@@ -617,7 +645,46 @@ func (rw *rewriter) createCommitIn(gitDir, treeSHA string, parents []string, msg
 	return strings.TrimSpace(string(out)), nil
 }
 
+// copyTreeFiltered copies a tree from one git dir to another,
+// skipping commit-map.json (which is local-only).
+func (rw *rewriter) copyTreeFiltered(srcGitDir, dstGitDir string, treeSHA string) (string, error) {
+	entries, err := rw.readTree(srcGitDir, treeSHA)
+	if err != nil {
+		return "", err
+	}
+
+	var newEntries []treeEntry
+	for _, e := range entries {
+		// Skip the commit map — it's a local cache.
+		if e.path == "commit-map.json" {
+			continue
+		}
+
+		if e.isTree() {
+			subSHA, err := rw.copyTreeFiltered(srcGitDir, dstGitDir, e.sha)
+			if err != nil {
+				return "", err
+			}
+			newEntries = append(newEntries, treeEntry{mode: e.mode, path: e.path, sha: subSHA})
+		} else {
+			// Copy blob from src to dst.
+			data, err := rw.readBlob(srcGitDir, e.sha)
+			if err != nil {
+				return "", err
+			}
+			newSHA, err := rw.gitInputOutput(dstGitDir, data, "hash-object", "-w", "--stdin")
+			if err != nil {
+				return "", err
+			}
+			newEntries = append(newEntries, treeEntry{mode: e.mode, path: e.path, sha: newSHA})
+		}
+	}
+
+	return rw.writeTreeTo(dstGitDir, newEntries)
+}
+
 // collectPaths collects all blob paths in a tree recursively.
+// Skips the .tomb/ directory since it is passed through unencrypted.
 func (rw *rewriter) collectPaths(gitDir, treeSHA, prefix string) ([]string, error) {
 	entries, err := rw.readTree(gitDir, treeSHA)
 	if err != nil {
@@ -626,6 +693,11 @@ func (rw *rewriter) collectPaths(gitDir, treeSHA, prefix string) ([]string, erro
 
 	var paths []string
 	for _, e := range entries {
+		// Skip .tomb/ — not part of the encrypted content.
+		if prefix == "" && e.path == tombDir {
+			continue
+		}
+
 		fullPath := e.path
 		if prefix != "" {
 			fullPath = prefix + "/" + e.path

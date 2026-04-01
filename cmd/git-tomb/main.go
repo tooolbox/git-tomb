@@ -234,6 +234,10 @@ func cmdInit(args []string) {
 		}
 	}
 
+	// Add .gitignore for the commit map (local-only cache).
+	gitignorePath := filepath.Join(gitRoot, ".tomb", ".gitignore")
+	os.WriteFile(gitignorePath, []byte("commit-map.json\n"), 0o644)
+
 	fmt.Printf("Tomb initialized with %d key(s) for %s (encryption: %s", len(fetchedKeys), displayName, encryptionMode)
 	if encryptionMode == tomb.EncryptionPerFile {
 		fmt.Printf(", scramble: %s", scrambleMode)
