@@ -466,6 +466,179 @@ func verifyRemoteScrambled(t *testing.T, remoteDir string, secret []byte) {
 	t.Logf("Remote commit message: %.60s...", msg)
 }
 
+// TestE2E_PushFetchWithGitDirEnv verifies that perFilePush and perFileFetch
+// work correctly when GIT_DIR is set in the environment, as happens when git
+// invokes the remote helper. Previously, the inherited GIT_DIR caused
+// git init --bare in the temp directory to target the wrong repo.
+func TestE2E_PushFetchWithGitDirEnv(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	tmp := t.TempDir()
+	sshDir := filepath.Join(tmp, "ssh")
+	localDir := filepath.Join(tmp, "local")
+	remoteDir := filepath.Join(tmp, "remote.git")
+	cloneDir := filepath.Join(tmp, "clone")
+
+	for _, d := range []string{sshDir, localDir, cloneDir} {
+		must(t, os.MkdirAll(d, 0o700))
+	}
+
+	// Generate test SSH keypair.
+	pubKeyStr, privKeyPath := generateTestKey(t, sshDir)
+	privPEM, err := os.ReadFile(privKeyPath)
+	if err != nil {
+		t.Fatalf("reading private key: %v", err)
+	}
+	recipient, err := agessh.ParseRecipient(pubKeyStr)
+	if err != nil {
+		t.Fatalf("parsing public key: %v", err)
+	}
+	identity, err := agessh.ParseIdentity(privPEM)
+	if err != nil {
+		t.Fatalf("parsing private key: %v", err)
+	}
+
+	// Create bare remote repo.
+	git(t, "", "init", "--bare", "--quiet", remoteDir)
+
+	// Create local repo with tomb config and files.
+	git(t, "", "init", "--quiet", localDir)
+	git(t, localDir, "config", "user.email", "test@test.com")
+	git(t, localDir, "config", "user.name", "Test User")
+
+	cfg := &tomb.Config{
+		Recipients: []tomb.Recipient{
+			{
+				Provider: "file",
+				Username: "test",
+				Keys:     []tomb.PinnedKey{{Raw: pubKeyStr, Fingerprint: "test-fp"}},
+			},
+		},
+		Scramble: tomb.ScrambleFull,
+	}
+	must(t, tomb.SaveConfig(localDir, cfg))
+	must(t, tomb.GenerateSecret(localDir, []age.Recipient{recipient}))
+
+	writeFile(t, localDir, "hello.txt", "hello world\n")
+	git(t, localDir, "add", "-A")
+	git(t, localDir, "commit", "--quiet", "-m", "Initial commit")
+
+	localGitDir := filepath.Join(localDir, ".git")
+	headSHA := strings.TrimSpace(gitOutput(t, localDir, "rev-parse", "HEAD"))
+
+	// Redirect stdout since perFilePush/perFileFetch write protocol responses there.
+	origStdout := os.Stdout
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { os.Stdout = origStdout }()
+
+	// --- Test push with GIT_DIR set ---
+	// Set GIT_DIR in the environment, simulating how git invokes the remote helper.
+	// This is the key part of the test — it must not interfere with temp repo creation.
+	t.Setenv("GIT_DIR", localGitDir)
+
+	h := &helper{
+		remoteName:       "origin",
+		url:              remoteDir,
+		gitDir:           localGitDir,
+		cachedIdentities: []age.Identity{identity},
+	}
+
+	os.Stdout = devNull
+	err = h.perFilePush([]string{"refs/heads/master:refs/heads/master"})
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("perFilePush with GIT_DIR set: %v", err)
+	}
+
+	// Clear GIT_DIR for verification and setup steps.
+	t.Setenv("GIT_DIR", "")
+	os.Unsetenv("GIT_DIR")
+
+	// Verify the remote has content (use --git-dir to target the remote).
+	remoteRefs := gitOutput(t, remoteDir, "show-ref")
+	if remoteRefs == "" {
+		t.Fatal("remote has no refs after push")
+	}
+	t.Logf("Remote refs after push:\n%s", remoteRefs)
+
+	git(t, "", "init", "--quiet", cloneDir)
+	git(t, cloneDir, "config", "user.email", "test@test.com")
+	git(t, cloneDir, "config", "user.name", "Test User")
+
+	// Copy .tomb/ to the clone so it can load the secret.
+	// Remove commit-map.json since it references objects that only exist in the
+	// original local repo, not in this fresh clone.
+	tombSrc := filepath.Join(localDir, ".tomb")
+	tombDst := filepath.Join(cloneDir, ".tomb")
+	must(t, copyDir(tombSrc, tombDst))
+	os.Remove(filepath.Join(tombDst, "commit-map.json"))
+
+	cloneGitDir := filepath.Join(cloneDir, ".git")
+
+	// Get the encrypted commit SHA from the remote (first ref line).
+	remoteSHA := strings.Fields(strings.TrimSpace(remoteRefs))[0]
+
+	// Now set GIT_DIR to the clone, simulating git invoking the remote helper.
+	t.Setenv("GIT_DIR", cloneGitDir)
+
+	h2 := &helper{
+		remoteName:       "origin",
+		url:              remoteDir,
+		gitDir:           cloneGitDir,
+		cachedIdentities: []age.Identity{identity},
+	}
+
+	// Format: "sha refname" — the remote SHA and the local ref to update.
+	os.Stdout = devNull
+	err = h2.perFileFetch([]string{remoteSHA + " refs/heads/master"})
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("perFileFetch with GIT_DIR set: %v", err)
+	}
+
+	// Verify the clone has refs.
+	cloneRefs := gitOutput(t, cloneDir, "show-ref")
+	t.Logf("Clone refs after fetch:\n%s", cloneRefs)
+
+	// Checkout and verify file content.
+	refLines := strings.Split(strings.TrimSpace(cloneRefs), "\n")
+	if len(refLines) == 0 || refLines[0] == "" {
+		t.Fatal("no refs in clone after fetch")
+	}
+	cloneSHA := strings.Fields(refLines[0])[0]
+	// Clear GIT_DIR for checkout.
+	t.Setenv("GIT_DIR", "")
+	os.Unsetenv("GIT_DIR")
+	git(t, cloneDir, "checkout", "--quiet", "-f", cloneSHA)
+	verifyFile(t, cloneDir, "hello.txt", "hello world\n")
+
+	t.Logf("Push local HEAD %s succeeded with GIT_DIR set", headSHA[:8])
+}
+
+// copyDir recursively copies a directory tree.
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, info.Mode())
+	})
+}
+
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {

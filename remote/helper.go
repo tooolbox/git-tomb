@@ -130,12 +130,15 @@ func (h *helper) list(forPush string) error {
 	if mode == tomb.EncryptionBundle {
 		return h.bundleList(forPush)
 	}
+	// Per-file mode or unknown (fresh clone) — per-file list uses ls-remote
+	// which works for any git remote, so it's a safe default.
 	return h.perFileList(forPush)
 }
 
 // perFileList reports refs for per-file mode by ls-remote + unscrambling.
 func (h *helper) perFileList(forPush string) error {
 	cmd := exec.Command("git", "ls-remote", h.url)
+	cmd.Env = filterGitEnv(os.Environ())
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
@@ -144,17 +147,8 @@ func (h *helper) perFileList(forPush string) error {
 		return nil
 	}
 
-	root, cfg, secret, err := h.loadTombState()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "tomb: warning: could not load tomb config: %v\n", err)
-		fmt.Print(string(out))
-		fmt.Println()
-		return nil
-	}
-	_ = root
-
-	refMap := h.buildRefMap(cfg, secret)
-
+	// Parse ls-remote output (tab-separated: sha\tref).
+	var refs []struct{ sha, ref string }
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -163,15 +157,32 @@ func (h *helper) perFileList(forPush string) error {
 		if len(parts) < 2 {
 			continue
 		}
-		sha := parts[0]
-		ref := parts[1]
+		refs = append(refs, struct{ sha, ref string }{parts[0], parts[1]})
+	}
 
+	root, cfg, secret, err := h.loadTombState()
+	if err != nil {
+		// Fresh clone — no .tomb/ yet. Print raw (scrambled) refs so git
+		// can proceed to fetch, which will extract .tomb/ from the remote.
+		fmt.Fprintf(os.Stderr, "tomb: warning: could not load tomb config: %v\n", err)
+		for _, r := range refs {
+			fmt.Printf("%s %s\n", r.sha, r.ref)
+		}
+		fmt.Println()
+		return nil
+	}
+	_ = root
+
+	refMap := h.buildRefMap(cfg, secret)
+
+	for _, r := range refs {
+		ref := r.ref
 		if orig, ok := refMap[ref]; ok {
 			ref = orig
 		}
 
-		fmt.Fprintf(os.Stderr, "tomb: ref: %s %s\n", sha, ref)
-		fmt.Printf("%s %s\n", sha, ref)
+		fmt.Fprintf(os.Stderr, "tomb: ref: %s %s\n", r.sha, ref)
+		fmt.Printf("%s %s\n", r.sha, ref)
 	}
 
 	fmt.Println()
@@ -179,19 +190,76 @@ func (h *helper) perFileList(forPush string) error {
 }
 
 // encryptionMode reads the config to determine bundle vs per-file mode.
+// On a fresh clone (no local .tomb/), it probes the remote to detect the mode.
 func (h *helper) encryptionMode() tomb.EncryptionMode {
 	root, err := tomb.FindRoot(h.repoDir())
 	if err != nil {
-		return tomb.EncryptionBundle // safe fallback for legacy repos
+		return h.detectRemoteMode()
 	}
 	cfg, err := tomb.LoadConfig(root)
 	if err != nil {
-		return tomb.EncryptionBundle
+		return h.detectRemoteMode()
 	}
 	if cfg.Encryption == "" {
 		return tomb.EncryptionBundle
 	}
 	return cfg.Encryption
+}
+
+// detectRemoteMode probes the remote to determine the encryption mode.
+// If the remote has a .tomb-manifest.age file, it's per-file mode.
+// Otherwise assume bundle mode (legacy default).
+func (h *helper) detectRemoteMode() tomb.EncryptionMode {
+	// Use ls-remote to get refs and a SHA we can inspect.
+	cmd := exec.Command("git", "ls-remote", "--refs", h.url)
+	cmd.Env = filterGitEnv(os.Environ())
+	out, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return tomb.EncryptionBundle // empty remote or error — default
+	}
+
+	// Get the first ref's SHA and use ls-tree to check for marker files.
+	firstLine := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+	sha := strings.Fields(firstLine)[0]
+
+	// Fetch the commit into a temp repo and inspect its tree.
+	tmpDir, err := os.MkdirTemp("", "tomb-detect-*")
+	if err != nil {
+		return tomb.EncryptionBundle
+	}
+	defer os.RemoveAll(tmpDir)
+
+	initCmd := exec.Command("git", "init", "--bare", "--quiet", tmpDir)
+	initCmd.Env = filterGitEnv(os.Environ())
+	if err := initCmd.Run(); err != nil {
+		return tomb.EncryptionBundle
+	}
+
+	fetchCmd := exec.Command("git", "--git-dir", tmpDir, "fetch", "--quiet", h.url, sha)
+	fetchCmd.Env = filterGitEnv(os.Environ())
+	if err := fetchCmd.Run(); err != nil {
+		return tomb.EncryptionBundle
+	}
+
+	// Check the fetched commit's tree for marker files.
+	lsCmd := exec.Command("git", "--git-dir", tmpDir, "ls-tree", "--name-only", sha)
+	lsCmd.Env = filterGitEnv(os.Environ())
+	treeOut, err := lsCmd.Output()
+	if err != nil {
+		return tomb.EncryptionBundle
+	}
+
+	tree := string(treeOut)
+	if strings.Contains(tree, ".tomb-manifest.age") {
+		fmt.Fprintf(os.Stderr, "tomb: detected per-file encryption mode from remote\n")
+		return tomb.EncryptionPerFile
+	}
+	if strings.Contains(tree, "tomb.bundle.age") {
+		fmt.Fprintf(os.Stderr, "tomb: detected bundle encryption mode from remote\n")
+		return tomb.EncryptionBundle
+	}
+
+	return tomb.EncryptionBundle
 }
 
 // fetch dispatches to the appropriate fetch implementation.
@@ -200,6 +268,8 @@ func (h *helper) fetch(refs []string) error {
 	if mode == tomb.EncryptionBundle {
 		return h.bundleFetch(refs)
 	}
+	// Per-file mode or unknown (fresh clone) — perFileFetch will extract
+	// .tomb/ from the remote if needed, so it handles the cold-start case.
 	return h.perFileFetch(refs)
 }
 
@@ -223,7 +293,9 @@ func (h *helper) perFileFetch(refs []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := run(tmpDir, "git", "init", "--bare", "--quiet"); err != nil {
+	// Pass tmpDir explicitly — the inherited GIT_DIR env var from the parent
+	// git process would otherwise cause init to target the wrong directory.
+	if err := run(tmpDir, "git", "init", "--bare", "--quiet", tmpDir); err != nil {
 		return fmt.Errorf("init temp repo: %w", err)
 	}
 
@@ -232,6 +304,7 @@ func (h *helper) perFileFetch(refs []string) error {
 	}
 
 	// Try to load tomb state from the local repo.
+	extractedTomb := false
 	root, cfg, secret, err := h.loadTombState()
 	if err != nil {
 		// On a fresh clone, .tomb/ doesn't exist locally yet.
@@ -240,6 +313,7 @@ func (h *helper) perFileFetch(refs []string) error {
 		if extractErr := h.extractTombFromRemote(tmpDir); extractErr != nil {
 			return fmt.Errorf("could not load tomb state locally or from remote: local: %v, remote: %v", err, extractErr)
 		}
+		extractedTomb = true
 		// Retry loading state.
 		root, cfg, secret, err = h.loadTombState()
 		if err != nil {
@@ -263,6 +337,15 @@ func (h *helper) perFileFetch(refs []string) error {
 		return fmt.Errorf("creating rewriter: %w", err)
 	}
 
+	// Copy all objects from the temp repo to the local repo so git can
+	// verify the remote SHAs exist. This is needed because the remote helper
+	// protocol's "fetch" capability requires the listed objects to be present
+	// after fetch completes, even though we transform them (decrypt).
+	fetchLocal := exec.Command("git", "--git-dir", absGitDir, "fetch", "--quiet", tmpDir, "+refs/*:refs/tomb-tmp/*")
+	fetchLocal.Env = filterGitEnv(os.Environ())
+	fetchLocal.Stderr = os.Stderr
+	fetchLocal.Run() // non-fatal — objects may already exist
+
 	// For each ref the user wants to fetch, translate the commit chain.
 	for _, ref := range refs {
 		// ref is like "sha refname" — we need the sha.
@@ -279,20 +362,47 @@ func (h *helper) perFileFetch(refs []string) error {
 		}
 
 		// Update local ref to point to the decrypted commit.
+		// The refName from git may be scrambled (especially on fresh clone
+		// where list couldn't unscramble). Build a reverse map to recover
+		// the original ref name.
 		refName := ""
 		parts := strings.Fields(ref)
 		if len(parts) >= 2 {
 			refName = parts[1]
 		}
 		if refName != "" {
+			if orig := reverseScrambleRef(secret, refName); orig != "" {
+				fmt.Fprintf(os.Stderr, "tomb: unscrambling ref %s → %s\n", refName, orig)
+				refName = orig
+			}
 			if err := rw.updateRef(absGitDir, refName, localSHA); err != nil {
 				return fmt.Errorf("updating ref %s: %w", refName, err)
 			}
 		}
 	}
 
+	// Clean up temporary refs used to import remote objects.
+	cleanRefs := exec.Command("git", "--git-dir", absGitDir, "for-each-ref", "--format=%(refname)", "refs/tomb-tmp/")
+	cleanRefs.Env = filterGitEnv(os.Environ())
+	if refList, err := cleanRefs.Output(); err == nil {
+		for _, r := range strings.Split(strings.TrimSpace(string(refList)), "\n") {
+			if r != "" {
+				delRef := exec.Command("git", "--git-dir", absGitDir, "update-ref", "-d", r)
+				delRef.Env = filterGitEnv(os.Environ())
+				delRef.Run()
+			}
+		}
+	}
+
 	if err := saveCommitMap(root, cm); err != nil {
 		fmt.Fprintf(os.Stderr, "tomb: warning: could not save commit map: %v\n", err)
+	}
+
+	// If we extracted .tomb/ temporarily for loading the secret, remove it
+	// so git's checkout doesn't conflict with the files in the commit tree.
+	if extractedTomb {
+		tombPath := filepath.Join(h.repoDir(), ".tomb")
+		os.RemoveAll(tombPath)
 	}
 
 	fmt.Println()
@@ -322,7 +432,9 @@ func (h *helper) perFilePush(specs []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := run(tmpDir, "git", "init", "--bare", "--quiet"); err != nil {
+	// Pass tmpDir explicitly — the inherited GIT_DIR env var from the parent
+	// git process would otherwise cause init to target the wrong directory.
+	if err := run(tmpDir, "git", "init", "--bare", "--quiet", tmpDir); err != nil {
 		return fmt.Errorf("init temp repo: %w", err)
 	}
 
@@ -341,6 +453,7 @@ func (h *helper) perFilePush(specs []string) error {
 	// Non-fatal if remote is empty.
 	fetchCmd := exec.Command("git", "fetch", "--quiet", h.url, "+refs/*:refs/*")
 	fetchCmd.Dir = tmpDir
+	fetchCmd.Env = filterGitEnv(os.Environ())
 	fetchCmd.Stderr = os.Stderr
 	fetchCmd.Run() // ignore error — remote might be empty
 
@@ -381,6 +494,7 @@ func (h *helper) perFilePush(specs []string) error {
 		// Push this ref to the remote.
 		pushCmd := exec.Command("git", "push", h.url, scrambledDst+":"+scrambledDst)
 		pushCmd.Dir = tmpDir
+		pushCmd.Env = filterGitEnv(os.Environ())
 		pushCmd.Stderr = os.Stderr
 		if err := pushCmd.Run(); err != nil {
 			fmt.Printf("error %s push failed: %v\n", dst, err)
@@ -426,6 +540,7 @@ func (h *helper) extractTombFromRemote(tmpDir string) error {
 	// Find any ref in the temp repo to get a commit with a .tomb/ entry.
 	cmd := exec.Command("git", "for-each-ref", "--format=%(objectname)", "--count=1", "refs/")
 	cmd.Dir = tmpDir
+	cmd.Env = filterGitEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return fmt.Errorf("no refs found in remote")
@@ -435,6 +550,7 @@ func (h *helper) extractTombFromRemote(tmpDir string) error {
 	// Get the tree SHA from the commit.
 	cmd = exec.Command("git", "rev-parse", commitSHA+"^{tree}")
 	cmd.Dir = tmpDir
+	cmd.Env = filterGitEnv(os.Environ())
 	out, err = cmd.Output()
 	if err != nil {
 		return fmt.Errorf("getting tree from commit: %w", err)
@@ -444,6 +560,7 @@ func (h *helper) extractTombFromRemote(tmpDir string) error {
 	// Look for .tomb/ in the tree.
 	cmd = exec.Command("git", "ls-tree", treeSHA, ".tomb/")
 	cmd.Dir = tmpDir
+	cmd.Env = filterGitEnv(os.Environ())
 	out, err = cmd.Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return fmt.Errorf(".tomb/ not found in remote tree")
@@ -453,6 +570,7 @@ func (h *helper) extractTombFromRemote(tmpDir string) error {
 	repoDir := h.repoDir()
 	cmd = exec.Command("git", "archive", "--format=tar", commitSHA, ".tomb/")
 	cmd.Dir = tmpDir
+	cmd.Env = filterGitEnv(os.Environ())
 
 	tar := exec.Command("tar", "xf", "-")
 	tar.Dir = repoDir
@@ -501,6 +619,27 @@ func (h *helper) buildRefMap(cfg *tomb.Config, secret []byte) map[string]string 
 	return refMap
 }
 
+// reverseScrambleRef attempts to find the original ref name by trying
+// common branch/tag names and checking if ScrambleRef produces the given
+// scrambled ref. Returns "" if no match is found.
+func reverseScrambleRef(secret []byte, scrambledRef string) string {
+	// Common branch names to try.
+	candidates := []string{
+		"main", "master", "develop", "dev", "staging", "production", "prod",
+		"release", "test", "testing", "feature", "hotfix", "bugfix",
+	}
+	// Try each candidate as refs/heads/ and refs/tags/.
+	for _, name := range candidates {
+		for _, prefix := range []string{"refs/heads/", "refs/tags/"} {
+			candidate := prefix + name
+			if crypt.ScrambleRef(secret, candidate) == scrambledRef {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
 func (rw *rewriter) resolveRef(gitDir, ref string) (string, error) {
 	out, err := rw.gitOutput(gitDir, "rev-parse", ref)
 	if err != nil {
@@ -510,8 +649,8 @@ func (rw *rewriter) resolveRef(gitDir, ref string) (string, error) {
 }
 
 func (rw *rewriter) updateRef(gitDir, ref, sha string) error {
-	cmd := exec.Command("git", "update-ref", ref, sha)
-	cmd.Dir = gitDir
+	cmd := exec.Command("git", "--git-dir", gitDir, "update-ref", ref, sha)
+	cmd.Env = filterGitEnv(os.Environ())
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -661,7 +800,17 @@ func readPassphrase(prompt string) ([]byte, error) {
 		if askpass == "" {
 			continue
 		}
-		cmd := exec.Command(askpass, prompt)
+		var cmd *exec.Cmd
+		// On Windows, .sh scripts can't be executed directly — run them through bash/sh.
+		if runtime.GOOS == "windows" && strings.HasSuffix(strings.ToLower(askpass), ".sh") {
+			shell := "bash"
+			if _, err := exec.LookPath("bash"); err != nil {
+				shell = "sh"
+			}
+			cmd = exec.Command(shell, askpass, prompt)
+		} else {
+			cmd = exec.Command(askpass, prompt)
+		}
 		cmd.Stderr = os.Stderr
 		out, err := cmd.Output()
 		if err != nil {
@@ -671,7 +820,7 @@ func readPassphrase(prompt string) ([]byte, error) {
 		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
-	// Try /dev/tty (Unix terminals).
+	// Try the console directly (Unix: /dev/tty, Windows: CONIN$).
 	if runtime.GOOS != "windows" {
 		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 		if err == nil {
@@ -681,15 +830,48 @@ func readPassphrase(prompt string) ([]byte, error) {
 			fmt.Fprintln(tty)
 			return pass, err
 		}
+	} else {
+		con, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
+		if err == nil {
+			defer con.Close()
+			// Write prompt to CONOUT$ so it appears even though stdout is used by the protocol.
+			if cout, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+				fmt.Fprint(cout, prompt)
+				cout.Close()
+			}
+			pass, err := term.ReadPassword(int(con.Fd()))
+			if cout, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+				fmt.Fprintln(cout)
+				cout.Close()
+			}
+			return pass, err
+		}
 	}
 
 	return nil, fmt.Errorf("cannot prompt for passphrase: set SSH_ASKPASS or GIT_ASKPASS, or use ssh-add to load your key into the agent")
 }
 
 // run executes a command in the given directory, inheriting stderr.
+// It clears GIT_DIR so the command targets the directory it's run in,
+// not the parent git process's repo.
 func run(dir string, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
+	cmd.Env = filterGitEnv(os.Environ())
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// filterGitEnv returns env with GIT_DIR and GIT_WORK_TREE removed,
+// so spawned git commands discover repos from their working directory.
+func filterGitEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		upper := strings.ToUpper(e)
+		if strings.HasPrefix(upper, "GIT_DIR=") || strings.HasPrefix(upper, "GIT_WORK_TREE=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }

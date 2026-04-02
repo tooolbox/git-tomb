@@ -630,7 +630,7 @@ func (rw *rewriter) createCommitIn(gitDir, treeSHA string, parents []string, msg
 	args = append(args, "-m", msg)
 
 	cmd := gitCmd(gitDir, args...)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(filterGitEnv(os.Environ()),
 		"GIT_AUTHOR_NAME="+authorName,
 		"GIT_AUTHOR_EMAIL="+authorEmail,
 		"GIT_AUTHOR_DATE="+authorDate,
@@ -725,7 +725,9 @@ func gitCmd(gitDir string, args ...string) *exec.Cmd {
 	// Use forward slashes for git compatibility on Windows.
 	cleanDir := strings.ReplaceAll(gitDir, "\\", "/")
 	fullArgs := append([]string{"--git-dir", cleanDir}, args...)
-	return exec.Command("git", fullArgs...)
+	cmd := exec.Command("git", fullArgs...)
+	cmd.Env = filterGitEnv(os.Environ())
+	return cmd
 }
 
 func (rw *rewriter) gitOutput(gitDir string, args ...string) ([]byte, error) {

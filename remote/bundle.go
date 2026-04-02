@@ -46,15 +46,31 @@ func (h *helper) bundleFetch(refs []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cloning encrypted remote: %w", err)
+	// Init a temp bare repo and fetch the remote's content.
+	initCmd := exec.Command("git", "init", "--bare", "--quiet", tmpDir)
+	initCmd.Env = filterGitEnv(os.Environ())
+	if err := initCmd.Run(); err != nil {
+		return fmt.Errorf("init temp repo: %w", err)
 	}
 
+	fetchCmd := exec.Command("git", "--git-dir", tmpDir, "fetch", "--quiet", h.url, "+refs/heads/*:refs/heads/*")
+	fetchCmd.Env = filterGitEnv(os.Environ())
+	fetchCmd.Stderr = os.Stderr
+	if err := fetchCmd.Run(); err != nil {
+		return fmt.Errorf("fetching remote: %w", err)
+	}
+
+	// Find a commit SHA to extract the bundle from.
+	refOut, err := exec.Command("git", "--git-dir", tmpDir, "for-each-ref", "--format=%(objectname)", "--count=1", "refs/").Output()
+	if err != nil || strings.TrimSpace(string(refOut)) == "" {
+		return fmt.Errorf("no refs found in remote")
+	}
+	commitSHA := strings.TrimSpace(string(refOut))
+
 	// Read and decrypt the bundle.
-	bundlePath := filepath.Join(tmpDir, "tomb.bundle.age")
-	encData, err := os.ReadFile(bundlePath)
+	showCmd := exec.Command("git", "--git-dir", tmpDir, "show", commitSHA+":tomb.bundle.age")
+	showCmd.Env = filterGitEnv(os.Environ())
+	encData, err := showCmd.Output()
 	if err != nil {
 		return fmt.Errorf("reading encrypted bundle: %w", err)
 	}
@@ -72,9 +88,10 @@ func (h *helper) bundleFetch(refs []string) error {
 
 	// Unbundle into the local repo.
 	absGitDir, _ := filepath.Abs(h.gitDir)
-	cmd = exec.Command("git", "--git-dir", absGitDir, "bundle", "unbundle", decBundle.Name())
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	unbundleCmd := exec.Command("git", "--git-dir", absGitDir, "bundle", "unbundle", decBundle.Name())
+	unbundleCmd.Env = filterGitEnv(os.Environ())
+	unbundleCmd.Stderr = os.Stderr
+	if err := unbundleCmd.Run(); err != nil {
 		return fmt.Errorf("unbundling: %w", err)
 	}
 
@@ -159,7 +176,9 @@ func (h *helper) bundlePush(specs []string) error {
 	}
 	defer os.RemoveAll(workDir)
 
-	if err := run(workDir, "git", "init", "--quiet"); err != nil {
+	// Pass workDir explicitly — the inherited GIT_DIR env var from the parent
+	// git process would otherwise cause init to target the wrong directory.
+	if err := run(workDir, "git", "init", "--quiet", workDir); err != nil {
 		return fmt.Errorf("init temp repo: %w", err)
 	}
 	if err := run(workDir, "git", "config", "user.email", "tomb@localhost"); err != nil {
@@ -244,14 +263,29 @@ func (h *helper) fetchBundleRefs() ([]string, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cmd := exec.Command("git", "clone", "--quiet", "--depth=1", h.url, tmpDir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("cloning remote: %w", err)
+	// Init a temp bare repo and fetch the remote's content.
+	if err := exec.Command("git", "init", "--bare", "--quiet", tmpDir).Run(); err != nil {
+		return nil, fmt.Errorf("init temp repo: %w", err)
 	}
 
-	refsPath := filepath.Join(tmpDir, "tomb.refs.age")
-	encData, err := os.ReadFile(refsPath)
+	fetchCmd := exec.Command("git", "--git-dir", tmpDir, "fetch", "--quiet", h.url, "+refs/heads/*:refs/heads/*")
+	fetchCmd.Env = filterGitEnv(os.Environ())
+	fetchCmd.Stderr = os.Stderr
+	if err := fetchCmd.Run(); err != nil {
+		return nil, fmt.Errorf("fetching remote: %w", err)
+	}
+
+	// Find the first ref and extract the refs file from its tree.
+	refOut, err := exec.Command("git", "--git-dir", tmpDir, "for-each-ref", "--format=%(objectname)", "--count=1", "refs/").Output()
+	if err != nil || strings.TrimSpace(string(refOut)) == "" {
+		return nil, fmt.Errorf("no refs found in remote")
+	}
+	commitSHA := strings.TrimSpace(string(refOut))
+
+	// Extract tomb.refs.age from the commit's tree.
+	showCmd := exec.Command("git", "--git-dir", tmpDir, "show", commitSHA+":tomb.refs.age")
+	showCmd.Env = filterGitEnv(os.Environ())
+	encData, err := showCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("reading refs file: %w", err)
 	}
